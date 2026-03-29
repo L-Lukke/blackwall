@@ -1,4 +1,4 @@
-````markdown
+
 # SSI Smart Home Gateway PoC
 
 ## What this project is
@@ -118,5 +118,3 @@ curl -s http://localhost:8090/state
 ```
 
 If everything is working, the gateway should authorize the request and the lock simulator should report the state as `unlocked`.
-
-```
