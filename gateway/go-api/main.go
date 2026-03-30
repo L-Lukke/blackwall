@@ -14,19 +14,21 @@ type Proof struct {
 }
 
 type Credential struct {
-	ID                 string   `json:"id"`
-	Type               string   `json:"type"`
-	Issuer             string   `json:"issuer"`
-	Subject            string   `json:"subject"`
-	Gateway            string   `json:"gateway"`
-	DeviceScopes       []string `json:"device_scopes"`
-	ActionScopes       []string `json:"action_scopes"`
-	DelegatedBy        string   `json:"delegated_by,omitempty"`
-	ParentCredentialID string   `json:"parent_credential_id,omitempty"`
-	IssuedAt           string   `json:"issued_at"`
-	ExpiresAt          string   `json:"expires_at"`
-	Status             string   `json:"status"`
-	Proof              Proof    `json:"proof"`
+	ID                  string   `json:"id"`
+	Type                string   `json:"type"`
+	Issuer              string   `json:"issuer"`
+	Subject             string   `json:"subject"`
+	Gateway             string   `json:"gateway"`
+	DeviceScopes        []string `json:"device_scopes"`
+	ActionScopes        []string `json:"action_scopes"`
+	DelegatedBy         string   `json:"delegated_by,omitempty"`
+	ParentCredentialID  string   `json:"parent_credential_id,omitempty"`
+	TransferredBy       string   `json:"transferred_by,omitempty"`
+	ReplacesCredentialID string  `json:"replaces_credential_id,omitempty"`
+	IssuedAt            string   `json:"issued_at"`
+	ExpiresAt           string   `json:"expires_at"`
+	Status              string   `json:"status"`
+	Proof               Proof    `json:"proof"`
 }
 
 type AccessRequest struct {

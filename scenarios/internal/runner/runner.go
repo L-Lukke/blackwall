@@ -29,19 +29,21 @@ type Proof struct {
 }
 
 type Credential struct {
-	ID                 string   `json:"id"`
-	Type               string   `json:"type"`
-	Issuer             string   `json:"issuer"`
-	Subject            string   `json:"subject"`
-	Gateway            string   `json:"gateway"`
-	DeviceScopes       []string `json:"device_scopes"`
-	ActionScopes       []string `json:"action_scopes"`
-	DelegatedBy        string   `json:"delegated_by,omitempty"`
-	ParentCredentialID string   `json:"parent_credential_id,omitempty"`
-	IssuedAt           string   `json:"issued_at"`
-	ExpiresAt          string   `json:"expires_at"`
-	Status             string   `json:"status"`
-	Proof              Proof    `json:"proof"`
+	ID                  string   `json:"id"`
+	Type                string   `json:"type"`
+	Issuer              string   `json:"issuer"`
+	Subject             string   `json:"subject"`
+	Gateway             string   `json:"gateway"`
+	DeviceScopes        []string `json:"device_scopes"`
+	ActionScopes        []string `json:"action_scopes"`
+	DelegatedBy         string   `json:"delegated_by,omitempty"`
+	ParentCredentialID  string   `json:"parent_credential_id,omitempty"`
+	TransferredBy       string   `json:"transferred_by,omitempty"`
+	ReplacesCredentialID string  `json:"replaces_credential_id,omitempty"`
+	IssuedAt            string   `json:"issued_at"`
+	ExpiresAt           string   `json:"expires_at"`
+	Status              string   `json:"status"`
+	Proof               Proof    `json:"proof"`
 }
 
 type OwnerCredentialRequest struct {
@@ -65,6 +67,21 @@ type RevokeCredentialRequest struct {
 	CredentialID    string     `json:"credential_id"`
 	RevokedBy       string     `json:"revoked_by"`
 	OwnerCredential Credential `json:"owner_credential"`
+}
+
+type TransferOwnershipRequest struct {
+	TransferredBy   string     `json:"transferred_by"`
+	NewSubject      string     `json:"new_subject"`
+	Gateway         string     `json:"gateway"`
+	DeviceScopes    []string   `json:"device_scopes,omitempty"`
+	ActionScopes    []string   `json:"action_scopes,omitempty"`
+	OwnerCredential Credential `json:"owner_credential"`
+}
+
+type TransferOwnershipResponse struct {
+	OK                  bool       `json:"ok"`
+	RevokedCredentialID string     `json:"revoked_credential_id"`
+	NewOwnerCredential  Credential `json:"new_owner_credential"`
 }
 
 type AccessRequest struct {
@@ -257,6 +274,65 @@ func (c *Client) RunRevocation() ScenarioResult {
 	return result
 }
 
+func (c *Client) RunOwnershipTransfer() ScenarioResult {
+	start := time.Now()
+	result := ScenarioResult{Name: "ownership-transfer"}
+
+	alice := uniqueDID("alice")
+	carol := uniqueDID("carol")
+
+	owner, err := c.issueOwnerCredential(alice, []string{"unlock", "lock"})
+	if err != nil {
+		return fail(result, start, "issue owner credential failed", err)
+	}
+	result.Steps = append(result.Steps, "issued owner credential for "+alice+" id="+owner.ID)
+
+	beforeResp, err := c.access(alice, "unlock", owner, http.StatusOK)
+	if err != nil {
+		return fail(result, start, "owner unlock before transfer failed", err)
+	}
+	if !beforeResp.Allowed || beforeResp.Reason != "allowed_by_owner_credential" {
+		return fail(result, start, "unexpected pre-transfer owner outcome", fmt.Errorf("allowed=%v reason=%s", beforeResp.Allowed, beforeResp.Reason))
+	}
+	result.Steps = append(result.Steps, "pre-transfer unlock allowed with reason="+beforeResp.Reason)
+
+	transferResp, err := c.transferOwnership(
+		alice,
+		carol,
+		owner,
+		[]string{c.cfg.DeviceID},
+		[]string{"unlock", "lock"},
+	)
+	if err != nil {
+		return fail(result, start, "ownership transfer failed", err)
+	}
+	result.Steps = append(result.Steps, "transferred ownership from "+alice+" to "+carol)
+	result.Steps = append(result.Steps, "revoked previous owner credential id="+transferResp.RevokedCredentialID)
+	result.Steps = append(result.Steps, "issued new owner credential id="+transferResp.NewOwnerCredential.ID)
+
+	oldOwnerResp, err := c.access(alice, "unlock", owner, http.StatusForbidden)
+	if err != nil {
+		return fail(result, start, "old owner unlock after transfer failed", err)
+	}
+	if oldOwnerResp.Allowed || oldOwnerResp.Reason != "credential_revoked" {
+		return fail(result, start, "unexpected old-owner post-transfer outcome", fmt.Errorf("allowed=%v reason=%s", oldOwnerResp.Allowed, oldOwnerResp.Reason))
+	}
+	result.Steps = append(result.Steps, "old owner denied after transfer with reason="+oldOwnerResp.Reason)
+
+	newOwnerResp, err := c.access(carol, "unlock", transferResp.NewOwnerCredential, http.StatusOK)
+	if err != nil {
+		return fail(result, start, "new owner unlock after transfer failed", err)
+	}
+	if !newOwnerResp.Allowed {
+		return fail(result, start, "new owner denied after transfer", fmt.Errorf("reason=%s", newOwnerResp.Reason))
+	}
+	result.Steps = append(result.Steps, "new owner allowed after transfer with reason="+newOwnerResp.Reason)
+
+	result.Passed = true
+	result.Duration = time.Since(start)
+	return result
+}
+
 func (c *Client) issueOwnerCredential(subject string, actions []string) (Credential, error) {
 	var cred Credential
 	err := c.postJSON(
@@ -304,6 +380,26 @@ func (c *Client) revokeCredential(credentialID, revokedBy string, ownerCredentia
 		&out,
 		http.StatusOK,
 	)
+}
+
+func (c *Client) transferOwnership(transferredBy string, newSubject string, ownerCredential Credential, deviceScopes []string, actionScopes []string) (TransferOwnershipResponse, error) {
+	var out TransferOwnershipResponse
+
+	err := c.postJSON(
+		c.cfg.IssuerURL+"/credentials/transfer",
+		TransferOwnershipRequest{
+			TransferredBy:   transferredBy,
+			NewSubject:      newSubject,
+			Gateway:         c.cfg.GatewayID,
+			DeviceScopes:    deviceScopes,
+			ActionScopes:    actionScopes,
+			OwnerCredential: ownerCredential,
+		},
+		&out,
+		http.StatusOK,
+	)
+
+	return out, err
 }
 
 func (c *Client) access(subject, action string, cred Credential, expectedStatus int) (AccessResponse, error) {

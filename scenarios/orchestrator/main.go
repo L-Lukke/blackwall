@@ -60,6 +60,8 @@ func main() {
 		case "6":
 			printResult(client.RunRevocation())
 		case "7":
+			printResult(client.RunOwnershipTransfer())
+		case "8":
 			printHealth(client.CheckHealth())
 			fmt.Println()
 			printResult(client.RunOwnerControl())
@@ -67,6 +69,8 @@ func main() {
 			printResult(client.RunDelegation())
 			fmt.Println()
 			printResult(client.RunRevocation())
+			fmt.Println()
+			printResult(client.RunOwnershipTransfer())
 		case "0", "q", "quit", "exit":
 			fmt.Println("bye")
 			return
@@ -85,7 +89,8 @@ func printMenu() {
 	fmt.Println("4) Run owner-control")
 	fmt.Println("5) Run delegation")
 	fmt.Println("6) Run revocation")
-	fmt.Println("7) Run all tests")
+	fmt.Println("7) Run ownership-transfer")
+	fmt.Println("8) Run all tests")
 	fmt.Println("0) Exit")
 }
 
