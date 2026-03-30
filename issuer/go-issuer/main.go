@@ -20,17 +20,19 @@ type Proof struct {
 }
 
 type Credential struct {
-	ID           string   `json:"id"`
-	Type         string   `json:"type"`
-	Issuer       string   `json:"issuer"`
-	Subject      string   `json:"subject"`
-	Gateway      string   `json:"gateway"`
-	DeviceScopes []string `json:"device_scopes"`
-	ActionScopes []string `json:"action_scopes"`
-	IssuedAt     string   `json:"issued_at"`
-	ExpiresAt    string   `json:"expires_at"`
-	Status       string   `json:"status"`
-	Proof        Proof    `json:"proof"`
+	ID                 string   `json:"id"`
+	Type               string   `json:"type"`
+	Issuer             string   `json:"issuer"`
+	Subject            string   `json:"subject"`
+	Gateway            string   `json:"gateway"`
+	DeviceScopes       []string `json:"device_scopes"`
+	ActionScopes       []string `json:"action_scopes"`
+	DelegatedBy        string   `json:"delegated_by,omitempty"`
+	ParentCredentialID string   `json:"parent_credential_id,omitempty"`
+	IssuedAt           string   `json:"issued_at"`
+	ExpiresAt          string   `json:"expires_at"`
+	Status             string   `json:"status"`
+	Proof              Proof    `json:"proof"`
 }
 
 type OwnerCredentialRequest struct {
@@ -40,10 +42,21 @@ type OwnerCredentialRequest struct {
 	ActionScopes []string `json:"action_scopes"`
 }
 
+type DelegationCredentialRequest struct {
+	DelegatedBy    string     `json:"delegated_by"`
+	Subject        string     `json:"subject"`
+	Gateway        string     `json:"gateway"`
+	DeviceScopes   []string   `json:"device_scopes"`
+	ActionScopes   []string   `json:"action_scopes"`
+	TTLMinutes     int        `json:"ttl_minutes"`
+	OwnerCredential Credential `json:"owner_credential"`
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/credentials/owner", ownerCredentialHandler)
+	mux.HandleFunc("/credentials/delegation", delegationCredentialHandler)
 
 	addr := getenv("ISSUER_ADDR", ":8082")
 	log.Printf("go-issuer listening on %s", addr)
@@ -70,6 +83,10 @@ func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_and_gateway_required"})
 		return
 	}
+	if len(req.DeviceScopes) == 0 || len(req.ActionScopes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device_scopes_and_action_scopes_required"})
+		return
+	}
 
 	now := time.Now().UTC()
 	cred := Credential{
@@ -84,21 +101,110 @@ func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:    now.Add(365 * 24 * time.Hour).Format(time.RFC3339),
 		Status:       "active",
 	}
-
 	cred.Proof = Proof{
 		Type:  "HMAC-SHA256",
 		Value: sign(getenv("ISSUER_SHARED_SECRET", "dev-secret"), signingInput(cred)),
 	}
 
-	if dir := os.Getenv("SAVE_CREDENTIALS_DIR"); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err == nil {
-			path := fmt.Sprintf("%s/%s.json", strings.TrimRight(dir, "/"), cred.ID)
-			if raw, err := json.Marshal(cred); err == nil {
-				_ = os.WriteFile(path, raw, 0o644)
-			}
-		}
+	saveCredential(cred)
+	writeJSON(w, http.StatusOK, cred)
+}
+
+func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
 	}
 
+	var req DelegationCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+		return
+	}
+
+	if req.DelegatedBy == "" || req.Subject == "" || req.Gateway == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "delegated_by_subject_and_gateway_required"})
+		return
+	}
+	if len(req.DeviceScopes) == 0 || len(req.ActionScopes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device_scopes_and_action_scopes_required"})
+		return
+	}
+
+	owner := req.OwnerCredential
+	secret := getenv("ISSUER_SHARED_SECRET", "dev-secret")
+
+	if owner.Type != "OwnerCredential" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
+		return
+	}
+	if owner.Subject != req.DelegatedBy {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
+		return
+	}
+	if owner.Gateway != req.Gateway {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_mismatch"})
+		return
+	}
+	if owner.Status != "active" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
+		return
+	}
+	if !verifySignature(secret, owner) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
+		return
+	}
+	if !isSubset(req.DeviceScopes, owner.DeviceScopes) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device_scopes_not_subset_of_owner"})
+		return
+	}
+	if !isSubset(req.ActionScopes, owner.ActionScopes) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "action_scopes_not_subset_of_owner"})
+		return
+	}
+
+	ownerExpiry, err := time.Parse(time.RFC3339, owner.ExpiresAt)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
+		return
+	}
+
+	now := time.Now().UTC()
+	if now.After(ownerExpiry) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_expired"})
+		return
+	}
+
+	ttlMinutes := req.TTLMinutes
+	if ttlMinutes <= 0 {
+		ttlMinutes = 120
+	}
+
+	expiresAt := now.Add(time.Duration(ttlMinutes) * time.Minute)
+	if expiresAt.After(ownerExpiry) {
+		expiresAt = ownerExpiry
+	}
+
+	cred := Credential{
+		ID:                 fmt.Sprintf("cred-%d", now.UnixNano()),
+		Type:               "DelegationCredential",
+		Issuer:             getenv("ISSUER_DID", "did:example:issuer"),
+		Subject:            req.Subject,
+		Gateway:            req.Gateway,
+		DeviceScopes:       req.DeviceScopes,
+		ActionScopes:       req.ActionScopes,
+		DelegatedBy:        req.DelegatedBy,
+		ParentCredentialID: owner.ID,
+		IssuedAt:           now.Format(time.RFC3339),
+		ExpiresAt:          expiresAt.Format(time.RFC3339),
+		Status:             "active",
+	}
+	cred.Proof = Proof{
+		Type:  "HMAC-SHA256",
+		Value: sign(secret, signingInput(cred)),
+	}
+
+	saveCredential(cred)
 	writeJSON(w, http.StatusOK, cred)
 }
 
@@ -108,7 +214,8 @@ func signingInput(c Credential) string {
 	sort.Strings(devices)
 	sort.Strings(actions)
 
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
+	return fmt.Sprintf(
+		"%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
 		c.ID,
 		c.Type,
 		c.Issuer,
@@ -116,6 +223,8 @@ func signingInput(c Credential) string {
 		c.Gateway,
 		strings.Join(devices, ","),
 		strings.Join(actions, ","),
+		c.DelegatedBy,
+		c.ParentCredentialID,
 		c.IssuedAt,
 		c.ExpiresAt,
 		c.Status,
@@ -126,6 +235,54 @@ func sign(secret, data string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(data))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifySignature(secret string, cred Credential) bool {
+	expected := sign(secret, signingInput(cred))
+	return hmac.Equal([]byte(expected), []byte(cred.Proof.Value))
+}
+
+func isSubset(requested, allowed []string) bool {
+	if contains(allowed, "*") {
+		return true
+	}
+
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, v := range allowed {
+		allowedSet[v] = struct{}{}
+	}
+
+	for _, v := range requested {
+		if _, ok := allowedSet[v]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(values []string, wanted string) bool {
+	for _, v := range values {
+		if v == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func saveCredential(cred Credential) {
+	dir := os.Getenv("SAVE_CREDENTIALS_DIR")
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	path := fmt.Sprintf("%s/%s.json", strings.TrimRight(dir, "/"), cred.ID)
+	raw, err := json.Marshal(cred)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, raw, 0o644)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
