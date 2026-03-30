@@ -6,9 +6,9 @@
 - [X] Implement the initial authorization endpoint in the Rust service
 - [X] Implement the initial gateway access-request endpoint
 - [X] Implement the first device simulator and gateway-to-device mediation
+- [X] Add delegation credential support and delegated-access flows
+- [X] Add revocation support and revocation-aware authorization
 
-- [ ] Add delegation credential support and delegated-access flows
-- [ ] Add revocation support and revocation-aware authorization
 - [ ] Add ownership-transfer support and authority replacement flows
 - [ ] Implement additional device simulators and adapters (light, sensor)
 - [ ] Add data-flow mediation/redirection for compatible devices
