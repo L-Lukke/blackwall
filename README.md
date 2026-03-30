@@ -45,127 +45,110 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 
 ## Testing
 
-Start each service in a separate terminal.
+The PoC is composed of four local services:
 
-### 1) Start the authorization service
+- **Authorization service (Rust)**  
+- **Lock simulator (Go)**  
+- **Gateway API (Go)**  
+- **Issuer service (Go)**  
+
+The recommended way to test the current PoC is to use the **scenario orchestrator**, which can start the local services and run the implemented scenarios from an interactive menu.
+### Prerequisites
+
+Make sure the following tools are available locally:
+
+- `go`
+- `cargo`
+
+Also run all commands from the **repository root**, unless noted otherwise.
+
+### Using the orchestrator
+
+First, sync the Go workspace:
+
 ```bash
-cd gateway/rust-authz
-
-AUTHZ_SHARED_SECRET=dev-secret \
-TRUSTED_ISSUER=did:example:issuer \
-GATEWAY_ID=gateway-home-1 \
-POLICY_FILE=../../testdata/policies/devices.json \
-REVOCATION_FILE=../../testdata/revocations/revoked_ids.json \
-cargo run
+go work sync
 ````
 
-### 2) Start the lock simulator
+Then start the orchestrator:
 
 ```bash
-cd devices/lock-sim
-go run .
+go run ./scenarios/orchestrator
 ```
 
-### 3) Start the gateway API
+You should see a menu:
 
-```bash
-cd gateway/go-api
-
-AUTHZ_URL=http://localhost:8081/v1/authorize \
-LOCK_URL=http://localhost:8090 \
-go run .
+```text
+1) Start all services
+2) Stop all services
+3) Show status / health
+4) Run owner-control
+5) Run delegation
+6) Run revocation
+7) Run all tests
+0) Exit
 ```
 
-### 4) Start the issuer
+### What the orchestrator does
 
-```bash
-cd issuer/go-issuer
+The orchestrator starts these local processes:
 
-ISSUER_DID=did:example:issuer \
-ISSUER_SHARED_SECRET=dev-secret \
-SAVE_CREDENTIALS_DIR=../../testdata/credentials \
-go run .
+* `gateway/rust-authz`
+* `devices/lock-sim`
+* `gateway/go-api`
+* `issuer/go-issuer`
+
+It also runs the implemented end-to-end scenarios against the live HTTP services.
+
+### Orchestrator logs
+
+When services are started by the orchestrator, logs are written under:
+
+```text
+scenarios/.logs/
 ```
 
-### 5) Issue an owner credential
+### Test state and repeated runs
 
-```bash
-curl -s http://localhost:8082/credentials/owner \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "subject": "did:example:alice",
-    "gateway": "gateway-home-1",
-    "device_scopes": ["lock-front-door"],
-    "action_scopes": ["unlock", "lock"]
-  }' > /tmp/alice-owner.json
+The revocation scenario modifies:
+
+```text
+testdata/revocations/revoked_ids.json
 ```
 
-### 6) Issue a delegation credential
-
-```bash
-curl -s http://localhost:8082/credentials/delegation \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"delegated_by\": \"did:example:alice\",
-    \"subject\": \"did:example:bob\",
-    \"gateway\": \"gateway-home-1\",
-    \"device_scopes\": [\"lock-front-door\"],
-    \"action_scopes\": [\"unlock\"],
-    \"ttl_minutes\": 120,
-    \"owner_credential\": $(cat /tmp/alice-owner.json)
-  }" > /tmp/bob-delegation.json
-```
-
-### 7) Test allowed access
-
-```bash
-curl -s http://localhost:8080/access/request \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"subject\": \"did:example:bob\",
-    \"device_id\": \"lock-front-door\",
-    \"action\": \"unlock\",
-    \"credential\": $(cat /tmp/bob-delegation.json)
-  }"
-```
-
-Expected: `allowed: true` with reason `allowed_by_delegation_credential`.
-
-### 8) Test denied access
-
-```bash
-curl -s http://localhost:8080/access/request \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"subject\": \"did:example:bob\",
-    \"device_id\": \"lock-front-door\",
-    \"action\": \"lock\",
-    \"credential\": $(cat /tmp/bob-delegation.json)
-  }"
-```
-
-Expected: `allowed: false` with reason `action_out_of_scope`.
-
-### 9) Optional revocation test
-
-Set `testdata/revocations/revoked_ids.json` to:
-
-```json
-{
-  "revoked_ids": ["<bob-credential-id>"]
-}
-```
-
-Then retry step 7. Expected: `allowed: false` with reason `credential_revoked`.
-
-````
-
-Also make sure `testdata/revocations/revoked_ids.json` starts as:
+For clean repeated runs, make sure this file starts as:
 
 ```json
 {
   "revoked_ids": []
 }
-````
+```
 
-If everything is working, the gateway should authorize the request and the lock simulator should report the state as `unlocked`.
+### Expected scenario outcomes
+
+#### Owner control
+
+* an owner credential is issued
+* the owner requests `unlock`
+* the request is allowed
+* expected reason: `allowed_by_owner_credential`
+
+#### Delegation
+
+* an owner credential is issued
+* a delegated credential is issued for another subject
+* delegated `unlock` is allowed
+* delegated `lock` is denied
+* expected deny reason: `action_out_of_scope`
+
+#### Revocation
+
+* a delegated credential is issued and works before revocation
+* the issuer revokes that delegated credential
+* the same delegated request is denied afterward
+* expected deny reason: `credential_revoked`
+
+### Notes
+
+* The orchestrator uses `127.0.0.1` for service URLs to avoid local IPv6 `localhost` issues on some systems.
+* The current automated test flow covers **owner control**, **delegation**, and **revocation**.
