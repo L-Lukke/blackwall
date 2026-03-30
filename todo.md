@@ -8,8 +8,8 @@
 - [X] Implement the first device simulator and gateway-to-device mediation
 - [X] Add delegation credential support and delegated-access flows
 - [X] Add revocation support and revocation-aware authorization
+- [X] Add ownership-transfer support and authority replacement flows
 
-- [ ] Add ownership-transfer support and authority replacement flows
 - [ ] Implement additional device simulators and adapters (light, sensor)
 - [ ] Add data-flow mediation/redirection for compatible devices
 - [ ] Expand the credential model toward fuller SSI alignment (DIDs, VC-like structures, proof handling)
