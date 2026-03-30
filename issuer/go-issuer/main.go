@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -43,13 +44,23 @@ type OwnerCredentialRequest struct {
 }
 
 type DelegationCredentialRequest struct {
-	DelegatedBy    string     `json:"delegated_by"`
-	Subject        string     `json:"subject"`
-	Gateway        string     `json:"gateway"`
-	DeviceScopes   []string   `json:"device_scopes"`
-	ActionScopes   []string   `json:"action_scopes"`
-	TTLMinutes     int        `json:"ttl_minutes"`
+	DelegatedBy     string     `json:"delegated_by"`
+	Subject         string     `json:"subject"`
+	Gateway         string     `json:"gateway"`
+	DeviceScopes    []string   `json:"device_scopes"`
+	ActionScopes    []string   `json:"action_scopes"`
+	TTLMinutes      int        `json:"ttl_minutes"`
 	OwnerCredential Credential `json:"owner_credential"`
+}
+
+type RevokeCredentialRequest struct {
+	CredentialID    string     `json:"credential_id"`
+	RevokedBy       string     `json:"revoked_by"`
+	OwnerCredential Credential `json:"owner_credential"`
+}
+
+type Revocations struct {
+	RevokedIDs []string `json:"revoked_ids"`
 }
 
 func main() {
@@ -57,6 +68,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/credentials/owner", ownerCredentialHandler)
 	mux.HandleFunc("/credentials/delegation", delegationCredentialHandler)
+	mux.HandleFunc("/credentials/revoke", revokeCredentialHandler)
 
 	addr := getenv("ISSUER_ADDR", ":8082")
 	log.Printf("go-issuer listening on %s", addr)
@@ -208,6 +220,78 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cred)
 }
 
+func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+
+	var req RevokeCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+		return
+	}
+
+	if req.CredentialID == "" || req.RevokedBy == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "credential_id_and_revoked_by_required"})
+		return
+	}
+
+	owner := req.OwnerCredential
+	secret := getenv("ISSUER_SHARED_SECRET", "dev-secret")
+
+	if owner.Type != "OwnerCredential" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
+		return
+	}
+	if owner.Subject != req.RevokedBy {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
+		return
+	}
+	if owner.Status != "active" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
+		return
+	}
+	if !verifySignature(secret, owner) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
+		return
+	}
+
+	ownerExpiry, err := time.Parse(time.RFC3339, owner.ExpiresAt)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
+		return
+	}
+	if time.Now().UTC().After(ownerExpiry) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_expired"})
+		return
+	}
+
+	path := getenv("REVOCATION_FILE", "../../testdata/revocations/revoked_ids.json")
+	revocations, err := loadRevocations(path)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
+		return
+	}
+
+	if !contains(revocations.RevokedIDs, req.CredentialID) {
+		revocations.RevokedIDs = append(revocations.RevokedIDs, req.CredentialID)
+		sort.Strings(revocations.RevokedIDs)
+	}
+
+	if err := saveRevocations(path, revocations); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_write_failed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"credential_id": req.CredentialID,
+		"revoked_by":    req.RevokedBy,
+		"revoked_ids":   revocations.RevokedIDs,
+	})
+}
+
 func signingInput(c Credential) string {
 	devices := append([]string(nil), c.DeviceScopes...)
 	actions := append([]string(nil), c.ActionScopes...)
@@ -283,6 +367,44 @@ func saveCredential(cred Credential) {
 		return
 	}
 	_ = os.WriteFile(path, raw, 0o644)
+}
+
+func loadRevocations(path string) (Revocations, error) {
+	var revocations Revocations
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Revocations{RevokedIDs: []string{}}, nil
+		}
+		return revocations, err
+	}
+
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return Revocations{RevokedIDs: []string{}}, nil
+	}
+
+	if err := json.Unmarshal(raw, &revocations); err != nil {
+		return revocations, err
+	}
+
+	if revocations.RevokedIDs == nil {
+		revocations.RevokedIDs = []string{}
+	}
+	return revocations, nil
+}
+
+func saveRevocations(path string, revocations Revocations) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	raw, err := json.MarshalIndent(revocations, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, raw, 0o644)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
