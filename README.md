@@ -85,7 +85,8 @@ You should see a menu:
 4) Run owner-control
 5) Run delegation
 6) Run revocation
-7) Run all tests
+7) Run ownership-transfer
+8) Run all tests
 0) Exit
 ```
 
@@ -106,22 +107,6 @@ When services are started by the orchestrator, logs are written under:
 
 ```text
 scenarios/.logs/
-```
-
-### Test state and repeated runs
-
-The revocation scenario modifies:
-
-```text
-testdata/revocations/revoked_ids.json
-```
-
-For clean repeated runs, make sure this file starts as:
-
-```json
-{
-  "revoked_ids": []
-}
 ```
 
 ### Expected scenario outcomes
