@@ -4,4 +4,5 @@ use (
 	./devices/lock-sim
 	./gateway/go-api
 	./issuer/go-issuer
+	./scenarios
 )

@@ -41,6 +41,10 @@ struct Credential {
     delegated_by: Option<String>,
     #[serde(default)]
     parent_credential_id: Option<String>,
+    #[serde(default)]
+    transferred_by: Option<String>,
+    #[serde(default)]
+    replaces_credential_id: Option<String>,
     issued_at: String,
     expires_at: String,
     status: String,
@@ -172,8 +176,18 @@ fn validate_common(state: &AppState, req: &AuthzRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn authorize_owner(_req: &AuthzRequest) -> Result<String, String> {
-    Ok("allowed_by_owner_credential".to_string())
+fn authorize_owner(req: &AuthzRequest) -> Result<String, String> {
+    let cred = &req.credential;
+
+    let has_transfer_lineage =
+        cred.transferred_by.as_deref().filter(|v| !v.is_empty()).is_some()
+        && cred.replaces_credential_id.as_deref().filter(|v| !v.is_empty()).is_some();
+
+    if has_transfer_lineage {
+        Ok("allowed_by_transferred_owner_credential".to_string())
+    } else {
+        Ok("allowed_by_owner_credential".to_string())
+    }
 }
 
 fn authorize_delegation(req: &AuthzRequest) -> Result<String, String> {
@@ -248,7 +262,7 @@ fn signing_input(cred: &Credential) -> String {
     actions.sort();
 
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         cred.id,
         cred.cred_type,
         cred.issuer,
@@ -258,6 +272,8 @@ fn signing_input(cred: &Credential) -> String {
         actions.join(","),
         cred.delegated_by.clone().unwrap_or_default(),
         cred.parent_credential_id.clone().unwrap_or_default(),
+        cred.transferred_by.clone().unwrap_or_default(),
+        cred.replaces_credential_id.clone().unwrap_or_default(),
         cred.issued_at,
         cred.expires_at,
         cred.status
