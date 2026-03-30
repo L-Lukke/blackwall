@@ -1,7 +1,0 @@
-{
-  "devices": {
-    "lock-front-door": {
-      "allowed_actions": ["lock", "unlock"]
-    }
-  }
-}

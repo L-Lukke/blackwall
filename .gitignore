@@ -26,9 +26,4 @@ testdata/runtime/
 configs/dev/local.override.yaml
 configs/dev/*.local.yaml
 
-testdata/credentials/*.json
-testdata/credentials/*.key
-testdata/credentials/*.pem
-testdata/credentials/*.secret.json
-testdata/credentials/*.private.json
-testdata/revocations/*
+testdata/*
