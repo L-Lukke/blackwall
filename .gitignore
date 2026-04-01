@@ -25,5 +25,3 @@ testdata/runtime/
 
 configs/dev/local.override.yaml
 configs/dev/*.local.yaml
-
-testdata/*
