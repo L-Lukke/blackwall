@@ -20,8 +20,7 @@ temp/
 dist/
 out/
 
-testdata/audit/
-testdata/runtime/
+testdata/*
 
 configs/dev/local.override.yaml
 configs/dev/*.local.yaml
