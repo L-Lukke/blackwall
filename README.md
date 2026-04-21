@@ -30,10 +30,10 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 - **Revocation** support and revocation-aware authorization
 - **Ownership transfer** flows
 - Additional device simulators and adapters (**light**, **sensor**)
+- Data-flow mediation/redirection for compatible devices
 
 ### To be implemented
 
-- Data-flow mediation/redirection for compatible devices
 - More complete SSI alignment for the credential model
 - Local policy management and richer household rules
 - Audit logging and authorization traceability
