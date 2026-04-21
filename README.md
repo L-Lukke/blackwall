@@ -26,13 +26,13 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 - Initial **authorization** endpoint in the Rust authz service
 - Initial **gateway access request** endpoint
 - First device simulator (**lock-sim**) and gateway-mediated lock control
-
-### To be implemented
-
 - **Delegation** credential support and delegated access flows
 - **Revocation** support and revocation-aware authorization
 - **Ownership transfer** flows
 - Additional device simulators and adapters (**light**, **sensor**)
+
+### To be implemented
+
 - Data-flow mediation/redirection for compatible devices
 - More complete SSI alignment for the credential model
 - Local policy management and richer household rules
