@@ -2,6 +2,7 @@ package procmanager
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ type ServiceSpec struct {
 	WorkDir string
 	Command []string
 	Env     []string
+	Port    int
 }
 
 type ManagedProcess struct {
@@ -62,6 +64,7 @@ func FindRepoRoot() string {
 func isRepoRoot(path string) bool {
 	required := []string{
 		"gateway",
+		"holder",
 		"issuer",
 		"devices",
 		"scenarios",
@@ -83,9 +86,9 @@ func DefaultSpecs() []ServiceSpec {
 			Name:    "authz",
 			WorkDir: "gateway/rust-authz",
 			Command: []string{"cargo", "run"},
+			Port:    8081,
 			Env: []string{
-				"AUTHZ_SHARED_SECRET=dev-secret",
-				"TRUSTED_ISSUER=did:example:issuer",
+				"TRUSTED_ISSUER=did:key:z6MkqPsfMdhSg1HSGhoxJG9Pm16yEYZ7oGMJm6QVALhqM3m2",
 				"GATEWAY_ID=gateway-home-1",
 				"POLICY_FILE=../../testdata/policies/devices.json",
 				"REVOCATION_FILE=../../testdata/revocations/revoked_ids.json",
@@ -96,25 +99,30 @@ func DefaultSpecs() []ServiceSpec {
 			WorkDir: "devices/lock-sim",
 			Command: []string{"go", "run", "."},
 			Env:     nil,
+			Port:    8090,
 		},
 		{
 			Name:    "sensor-sim",
 			WorkDir: "devices/sensor-sim",
 			Command: []string{"go", "run", "."},
 			Env:     nil,
+			Port:    8091,
 		},
 		{
 			Name:    "light-sim",
 			WorkDir: "devices/light-sim",
 			Command: []string{"go", "run", "."},
 			Env:     nil,
+			Port:    8092,
 		},
 		{
 			Name:    "gateway",
 			WorkDir: "gateway/go-api",
 			Command: []string{"go", "run", "."},
+			Port:    8080,
 			Env: []string{
 				"AUTHZ_URL=http://127.0.0.1:8081/v1/authorize",
+				"GATEWAY_ID=gateway-home-1",
 				"LOCK_URL=http://127.0.0.1:8090",
 				"SENSOR_URL=http://127.0.0.1:8091",
 				"LIGHT_URL=http://127.0.0.1:8092",
@@ -125,11 +133,18 @@ func DefaultSpecs() []ServiceSpec {
 			Name:    "issuer",
 			WorkDir: "issuer/go-issuer",
 			Command: []string{"go", "run", "."},
+			Port:    8082,
 			Env: []string{
-				"ISSUER_DID=did:example:issuer",
-				"ISSUER_SHARED_SECRET=dev-secret",
+				"ISSUER_DID=did:key:z6MkqPsfMdhSg1HSGhoxJG9Pm16yEYZ7oGMJm6QVALhqM3m2",
 				"SAVE_CREDENTIALS_DIR=../../testdata/credentials",
 			},
+		},
+		{
+			Name:    "wallet",
+			WorkDir: "holder/go-wallet",
+			Command: []string{"go", "run", "."},
+			Port:    8083,
+			Env:     nil,
 		},
 	}
 }
@@ -149,6 +164,10 @@ func (m *Manager) StartAll() error {
 			}
 			_ = closeManagedResources(existing)
 			delete(m.services, spec.Name)
+		}
+
+		if spec.Port != 0 && isPortInUse(spec.Port) {
+			return fmt.Errorf("start %s: port %d is already in use; stop the existing service before starting managed services", spec.Name, spec.Port)
 		}
 
 		logPath := filepath.Join(m.logDir, spec.Name+".log")
@@ -267,4 +286,13 @@ func isManagedProcessRunning(proc *ManagedProcess) bool {
 	pid := proc.Cmd.Process.Pid
 	err := syscall.Kill(pid, 0)
 	return err == nil
+}
+
+func isPortInUse(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }

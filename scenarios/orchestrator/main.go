@@ -92,6 +92,7 @@ func printHeader(repoRoot string, cfg runner.Config) {
 	fmt.Printf("Repo Root     : %s\n", repoRoot)
 	fmt.Printf("Issuer URL    : %s\n", cfg.IssuerURL)
 	fmt.Printf("Gateway URL   : %s\n", cfg.GatewayURL)
+	fmt.Printf("Wallet URL    : %s\n", cfg.WalletURL)
 	fmt.Printf("Gateway ID    : %s\n", cfg.GatewayID)
 	fmt.Printf("Sensor Device : %s\n", cfg.SensorDeviceID)
 	fmt.Printf("Lock Device   : %s\n", cfg.DeviceID)
@@ -220,14 +221,15 @@ func testFlowsMenu(reader *bufio.Reader, client *runner.Client) bool {
 		fmt.Println("3) Run revocation")
 		fmt.Println("4) Run ownership-transfer")
 		fmt.Println("5) Run data-flow-mediation")
-		fmt.Println("6) Run all tests")
-		fmt.Println("7) Previous menu")
-		fmt.Println("8) Quit")
+		fmt.Println("6) Run vp-challenge")
+		fmt.Println("7) Run all tests")
+		fmt.Println("8) Previous menu")
+		fmt.Println("9) Quit")
 
 		flowChoice := readChoice(reader)
 
 		switch flowChoice {
-		case "1", "2", "3", "4", "5", "6":
+		case "1", "2", "3", "4", "5", "6", "7":
 			target, canceled, quit := selectDeviceForTest(reader, client)
 			if quit {
 				return true
@@ -238,10 +240,10 @@ func testFlowsMenu(reader *bufio.Reader, client *runner.Client) bool {
 
 			runSelectedFlow(client, flowChoice, target)
 
-		case "7":
+		case "8":
 			return false
 
-		case "8", "q", "quit", "exit":
+		case "9", "q", "quit", "exit":
 			return true
 
 		default:
@@ -304,6 +306,9 @@ func runSelectedFlow(client *runner.Client, flowChoice string, target runner.Dev
 		printResult(client.RunDataFlowMediationOn(target))
 
 	case "6":
+		printResult(client.RunVPChallengeFlowOn(target))
+
+	case "7":
 		runAll(client, target)
 	}
 }
@@ -322,6 +327,9 @@ func runAll(client *runner.Client, target runner.DeviceTarget) {
 	fmt.Println()
 
 	printResult(client.RunOwnershipTransferOn(target))
+	fmt.Println()
+
+	printResult(client.RunVPChallengeFlowOn(target))
 
 	if target.SupportsDataFlow {
 		fmt.Println()

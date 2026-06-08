@@ -151,6 +151,72 @@ func (c *Client) RunOwnerControlOn(target DeviceTarget) ScenarioResult {
 	return result
 }
 
+func (c *Client) RunVPChallengeFlowOn(target DeviceTarget) ScenarioResult {
+	start := time.Now()
+	result := ScenarioResult{Name: "vp-challenge/" + string(target.Kind)}
+
+	holderDID, err := c.walletDID()
+	if err != nil {
+		return fail(result, start, "resolve wallet did failed", err)
+	}
+	result.Steps = append(result.Steps, "wallet holder did="+holderDID)
+
+	owner, err := c.issueOwnerCredentialForDevice(holderDID, target.DeviceID, []string{target.PrimaryAction})
+	if err != nil {
+		return fail(result, start, "issue owner credential failed", err)
+	}
+	result.Steps = append(result.Steps, fmt.Sprintf(
+		"issued owner credential id=%s device=%s action=%s",
+		owner.ID,
+		target.DeviceID,
+		target.PrimaryAction,
+	))
+
+	if err := c.storeCredentialInWallet(owner); err != nil {
+		return fail(result, start, "store credential in wallet failed", err)
+	}
+	result.Steps = append(result.Steps, "stored credential in holder wallet")
+
+	challenge, err := c.requestChallenge(holderDID, target.DeviceID, target.PrimaryAction)
+	if err != nil {
+		return fail(result, start, "request gateway challenge failed", err)
+	}
+	result.Steps = append(result.Steps, "gateway challenge issued for domain="+challenge.Domain)
+
+	presentation, err := c.createPresentation(owner.ID, challenge.Challenge, challenge.Domain)
+	if err != nil {
+		return fail(result, start, "create presentation failed", err)
+	}
+	result.Steps = append(result.Steps, "wallet signed verifiable presentation id="+presentation.ID)
+
+	allowResp, err := c.accessDeviceWithPresentation(
+		holderDID,
+		target.DeviceID,
+		target.PrimaryAction,
+		challenge.Challenge,
+		presentation,
+		http.StatusOK,
+	)
+	if err != nil {
+		return fail(result, start, "vp access request failed", err)
+	}
+	if !allowResp.Allowed || allowResp.Reason != "allowed_by_owner_credential" {
+		return fail(result, start, "unexpected vp-challenge outcome", fmt.Errorf("allowed=%v reason=%s", allowResp.Allowed, allowResp.Reason))
+	}
+	result.Steps = append(result.Steps, fmt.Sprintf(
+		"vp %s allowed with reason=%s",
+		target.PrimaryAction,
+		allowResp.Reason,
+	))
+	if allowResp.PersistedTo != "" {
+		result.Steps = append(result.Steps, "data persisted to "+allowResp.PersistedTo)
+	}
+
+	result.Passed = true
+	result.Duration = time.Since(start)
+	return result
+}
+
 func (c *Client) RunDelegationOn(target DeviceTarget) ScenarioResult {
 	start := time.Now()
 	result := ScenarioResult{Name: "delegation/" + string(target.Kind)}

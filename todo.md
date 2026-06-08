@@ -14,7 +14,7 @@
 - [X] Add audit logging and authorization decision traceability
 - [X] Implement scenario runners for owner control, delegation, revocation, and ownership transfer
 - [X] Add performance/feasibility measurements (latency, verification time, resource usage)
-- [ ] Expand the credential model toward fuller SSI alignment (DIDs, VC-like structures, proof handling)
+- [X] Expand the credential model toward fuller SSI alignment (DIDs, VC-like structures, proof handling)
 - [ ] Implement local policy management and policy-enforcement support for household rules
 - [ ] Add integration tests, scenario tests, and correctness validation
 - [ ] Write ADRs, API documentation, and reproducible dev/runtime scripts

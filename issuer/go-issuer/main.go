@@ -1,8 +1,7 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,26 +15,42 @@ import (
 )
 
 type Proof struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+	Type               string `json:"type"`
+	Cryptosuite        string `json:"cryptosuite"`
+	Created            string `json:"created"`
+	VerificationMethod string `json:"verificationMethod"`
+	ProofPurpose       string `json:"proofPurpose"`
+	ProofValue         string `json:"proofValue"`
 }
 
 type Credential struct {
-	ID                  string   `json:"id"`
-	Type                string   `json:"type"`
-	Issuer              string   `json:"issuer"`
-	Subject             string   `json:"subject"`
-	Gateway             string   `json:"gateway"`
-	DeviceScopes        []string `json:"device_scopes"`
-	ActionScopes        []string `json:"action_scopes"`
-	DelegatedBy         string   `json:"delegated_by,omitempty"`
-	ParentCredentialID  string   `json:"parent_credential_id,omitempty"`
-	TransferredBy       string   `json:"transferred_by,omitempty"`
-	ReplacesCredentialID string  `json:"replaces_credential_id,omitempty"`
-	IssuedAt            string   `json:"issued_at"`
-	ExpiresAt           string   `json:"expires_at"`
-	Status              string   `json:"status"`
-	Proof               Proof    `json:"proof"`
+	Context           []string          `json:"@context"`
+	ID                string            `json:"id"`
+	Type              []string          `json:"type"`
+	Issuer            string            `json:"issuer"`
+	ValidFrom         string            `json:"validFrom"`
+	ValidUntil        string            `json:"validUntil"`
+	CredentialSubject CredentialSubject `json:"credentialSubject"`
+	CredentialStatus  CredentialStatus  `json:"credentialStatus"`
+	Proof             *Proof            `json:"proof,omitempty"`
+}
+
+type CredentialSubject struct {
+	ID                   string   `json:"id"`
+	Gateway              string   `json:"gateway"`
+	DeviceScopes         []string `json:"deviceScopes"`
+	ActionScopes         []string `json:"actionScopes"`
+	DelegatedBy          string   `json:"delegatedBy,omitempty"`
+	ParentCredentialID   string   `json:"parentCredentialId,omitempty"`
+	TransferredBy        string   `json:"transferredBy,omitempty"`
+	ReplacesCredentialID string   `json:"replacesCredentialId,omitempty"`
+}
+
+type CredentialStatus struct {
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	StatusPurpose string `json:"statusPurpose"`
+	Status        string `json:"status"`
 }
 
 type OwnerCredentialRequest struct {
@@ -113,22 +128,8 @@ func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	cred := Credential{
-		ID:           fmt.Sprintf("cred-%d", now.UnixNano()),
-		Type:         "OwnerCredential",
-		Issuer:       getenv("ISSUER_DID", "did:example:issuer"),
-		Subject:      req.Subject,
-		Gateway:      req.Gateway,
-		DeviceScopes: req.DeviceScopes,
-		ActionScopes: req.ActionScopes,
-		IssuedAt:     now.Format(time.RFC3339),
-		ExpiresAt:    now.Add(365 * 24 * time.Hour).Format(time.RFC3339),
-		Status:       "active",
-	}
-	cred.Proof = Proof{
-		Type:  "HMAC-SHA256",
-		Value: sign(getenv("ISSUER_SHARED_SECRET", "dev-secret"), signingInput(cred)),
-	}
+	cred := newCredential("OwnerCredential", req.Subject, req.Gateway, req.DeviceScopes, req.ActionScopes, now, now.Add(365*24*time.Hour))
+	cred.Proof = signCredential(cred, now)
 
 	saveCredential(cred)
 	writeJSON(w, http.StatusOK, cred)
@@ -156,38 +157,36 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	owner := req.OwnerCredential
-	secret := getenv("ISSUER_SHARED_SECRET", "dev-secret")
-
-	if owner.Type != "OwnerCredential" {
+	if !hasType(owner, "OwnerCredential") {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
 		return
 	}
-	if owner.Subject != req.DelegatedBy {
+	if owner.CredentialSubject.ID != req.DelegatedBy {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
 		return
 	}
-	if owner.Gateway != req.Gateway {
+	if owner.CredentialSubject.Gateway != req.Gateway {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_mismatch"})
 		return
 	}
-	if owner.Status != "active" {
+	if owner.CredentialStatus.Status != "active" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
 		return
 	}
-	if !verifySignature(secret, owner) {
+	if !verifySignature(owner) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
 		return
 	}
-	if !isSubset(req.DeviceScopes, owner.DeviceScopes) {
+	if !isSubset(req.DeviceScopes, owner.CredentialSubject.DeviceScopes) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device_scopes_not_subset_of_owner"})
 		return
 	}
-	if !isSubset(req.ActionScopes, owner.ActionScopes) {
+	if !isSubset(req.ActionScopes, owner.CredentialSubject.ActionScopes) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "action_scopes_not_subset_of_owner"})
 		return
 	}
 
-	ownerExpiry, err := time.Parse(time.RFC3339, owner.ExpiresAt)
+	ownerExpiry, err := time.Parse(time.RFC3339, owner.ValidUntil)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
 		return
@@ -209,24 +208,10 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		expiresAt = ownerExpiry
 	}
 
-	cred := Credential{
-		ID:                 fmt.Sprintf("cred-%d", now.UnixNano()),
-		Type:               "DelegationCredential",
-		Issuer:             getenv("ISSUER_DID", "did:example:issuer"),
-		Subject:            req.Subject,
-		Gateway:            req.Gateway,
-		DeviceScopes:       req.DeviceScopes,
-		ActionScopes:       req.ActionScopes,
-		DelegatedBy:        req.DelegatedBy,
-		ParentCredentialID: owner.ID,
-		IssuedAt:           now.Format(time.RFC3339),
-		ExpiresAt:          expiresAt.Format(time.RFC3339),
-		Status:             "active",
-	}
-	cred.Proof = Proof{
-		Type:  "HMAC-SHA256",
-		Value: sign(secret, signingInput(cred)),
-	}
+	cred := newCredential("DelegationCredential", req.Subject, req.Gateway, req.DeviceScopes, req.ActionScopes, now, expiresAt)
+	cred.CredentialSubject.DelegatedBy = req.DelegatedBy
+	cred.CredentialSubject.ParentCredentialID = owner.ID
+	cred.Proof = signCredential(cred, now)
 
 	saveCredential(cred)
 	writeJSON(w, http.StatusOK, cred)
@@ -250,26 +235,24 @@ func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	owner := req.OwnerCredential
-	secret := getenv("ISSUER_SHARED_SECRET", "dev-secret")
-
-	if owner.Type != "OwnerCredential" {
+	if !hasType(owner, "OwnerCredential") {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
 		return
 	}
-	if owner.Subject != req.RevokedBy {
+	if owner.CredentialSubject.ID != req.RevokedBy {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
 		return
 	}
-	if owner.Status != "active" {
+	if owner.CredentialStatus.Status != "active" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
 		return
 	}
-	if !verifySignature(secret, owner) {
+	if !verifySignature(owner) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
 		return
 	}
 
-	ownerExpiry, err := time.Parse(time.RFC3339, owner.ExpiresAt)
+	ownerExpiry, err := time.Parse(time.RFC3339, owner.ValidUntil)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
 		return
@@ -326,30 +309,28 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	owner := req.OwnerCredential
-	secret := getenv("ISSUER_SHARED_SECRET", "dev-secret")
-
-	if owner.Type != "OwnerCredential" {
+	if !hasType(owner, "OwnerCredential") {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
 		return
 	}
-	if owner.Subject != req.TransferredBy {
+	if owner.CredentialSubject.ID != req.TransferredBy {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
 		return
 	}
-	if owner.Gateway != req.Gateway {
+	if owner.CredentialSubject.Gateway != req.Gateway {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_mismatch"})
 		return
 	}
-	if owner.Status != "active" {
+	if owner.CredentialStatus.Status != "active" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
 		return
 	}
-	if !verifySignature(secret, owner) {
+	if !verifySignature(owner) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
 		return
 	}
 
-	ownerExpiry, err := time.Parse(time.RFC3339, owner.ExpiresAt)
+	ownerExpiry, err := time.Parse(time.RFC3339, owner.ValidUntil)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
 		return
@@ -371,42 +352,28 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deviceScopes := owner.DeviceScopes
-	actionScopes := owner.ActionScopes
+	deviceScopes := owner.CredentialSubject.DeviceScopes
+	actionScopes := owner.CredentialSubject.ActionScopes
 
 	if len(req.DeviceScopes) > 0 {
-		if !isSubset(req.DeviceScopes, owner.DeviceScopes) {
+		if !isSubset(req.DeviceScopes, owner.CredentialSubject.DeviceScopes) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device_scopes_not_subset_of_owner"})
 			return
 		}
 		deviceScopes = req.DeviceScopes
 	}
 	if len(req.ActionScopes) > 0 {
-		if !isSubset(req.ActionScopes, owner.ActionScopes) {
+		if !isSubset(req.ActionScopes, owner.CredentialSubject.ActionScopes) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "action_scopes_not_subset_of_owner"})
 			return
 		}
 		actionScopes = req.ActionScopes
 	}
 
-	newCred := Credential{
-		ID:                  fmt.Sprintf("cred-%d", now.UnixNano()),
-		Type:                "OwnerCredential",
-		Issuer:              getenv("ISSUER_DID", "did:example:issuer"),
-		Subject:             req.NewSubject,
-		Gateway:             req.Gateway,
-		DeviceScopes:        deviceScopes,
-		ActionScopes:        actionScopes,
-		TransferredBy:       req.TransferredBy,
-		ReplacesCredentialID: owner.ID,
-		IssuedAt:            now.Format(time.RFC3339),
-		ExpiresAt:           ownerExpiry.Format(time.RFC3339),
-		Status:              "active",
-	}
-	newCred.Proof = Proof{
-		Type:  "HMAC-SHA256",
-		Value: sign(secret, signingInput(newCred)),
-	}
+	newCred := newCredential("OwnerCredential", req.NewSubject, req.Gateway, deviceScopes, actionScopes, now, ownerExpiry)
+	newCred.CredentialSubject.TransferredBy = req.TransferredBy
+	newCred.CredentialSubject.ReplacesCredentialID = owner.ID
+	newCred.Proof = signCredential(newCred, now)
 
 	revocations.RevokedIDs = appendUnique(revocations.RevokedIDs, owner.ID)
 	sort.Strings(revocations.RevokedIDs)
@@ -419,46 +386,152 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 	saveCredential(newCred)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                   true,
+		"ok":                    true,
 		"revoked_credential_id": owner.ID,
-		"new_owner_credential": newCred,
+		"new_owner_credential":  newCred,
 	})
 }
 
-func signingInput(c Credential) string {
-	devices := append([]string(nil), c.DeviceScopes...)
-	actions := append([]string(nil), c.ActionScopes...)
-	sort.Strings(devices)
-	sort.Strings(actions)
-
-	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s",
-		c.ID,
-		c.Type,
-		c.Issuer,
-		c.Subject,
-		c.Gateway,
-		strings.Join(devices, ","),
-		strings.Join(actions, ","),
-		c.DelegatedBy,
-		c.ParentCredentialID,
-		c.TransferredBy,
-		c.ReplacesCredentialID,
-		c.IssuedAt,
-		c.ExpiresAt,
-		c.Status,
-	)
+func newCredential(kind, subject, gateway string, deviceScopes, actionScopes []string, validFrom, validUntil time.Time) Credential {
+	id := fmt.Sprintf("urn:uuid:cred-%d", validFrom.UnixNano())
+	return Credential{
+		Context: []string{
+			"https://www.w3.org/ns/credentials/v2",
+			"https://blackwall.local/contexts/smart-home-authorization/v1",
+		},
+		ID:         id,
+		Type:       []string{"VerifiableCredential", kind},
+		Issuer:     getenv("ISSUER_DID", defaultIssuerDID()),
+		ValidFrom:  validFrom.Format(time.RFC3339),
+		ValidUntil: validUntil.Format(time.RFC3339),
+		CredentialSubject: CredentialSubject{
+			ID:           subject,
+			Gateway:      gateway,
+			DeviceScopes: deviceScopes,
+			ActionScopes: actionScopes,
+		},
+		CredentialStatus: CredentialStatus{
+			ID:            id + "#status",
+			Type:          "BlackwallRevocationStatus2026",
+			StatusPurpose: "revocation",
+			Status:        "active",
+		},
+	}
 }
 
-func sign(secret, data string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(data))
-	return hex.EncodeToString(mac.Sum(nil))
+func signingInput(c Credential) []byte {
+	c.Proof = nil
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
-func verifySignature(secret string, cred Credential) bool {
-	expected := sign(secret, signingInput(cred))
-	return hmac.Equal([]byte(expected), []byte(cred.Proof.Value))
+func signCredential(cred Credential, now time.Time) *Proof {
+	privateKey := issuerPrivateKey()
+	signature := ed25519.Sign(privateKey, signingInput(cred))
+	issuerDID := getenv("ISSUER_DID", defaultIssuerDID())
+	return &Proof{
+		Type:               "DataIntegrityProof",
+		Cryptosuite:        "eddsa-rdfc-2022",
+		Created:            now.Format(time.RFC3339),
+		VerificationMethod: getenv("ISSUER_VERIFICATION_METHOD", issuerDID+"#key-1"),
+		ProofPurpose:       "assertionMethod",
+		ProofValue:         hex.EncodeToString(signature),
+	}
+}
+
+func verifySignature(cred Credential) bool {
+	if cred.Proof == nil {
+		return false
+	}
+	signature, err := hex.DecodeString(cred.Proof.ProofValue)
+	if err != nil {
+		return false
+	}
+	return ed25519.Verify(issuerPublicKey(), signingInput(cred), signature)
+}
+
+func issuerPrivateKey() ed25519.PrivateKey {
+	if rawHex := os.Getenv("ISSUER_ED25519_PRIVATE_KEY_HEX"); rawHex != "" {
+		raw, err := hex.DecodeString(rawHex)
+		if err == nil && len(raw) == ed25519.PrivateKeySize {
+			return ed25519.PrivateKey(raw)
+		}
+		if err == nil && len(raw) == ed25519.SeedSize {
+			return ed25519.NewKeyFromSeed(raw)
+		}
+	}
+	return ed25519.NewKeyFromSeed(defaultIssuerEd25519Seed())
+}
+
+func issuerPublicKey() ed25519.PublicKey {
+	if rawHex := os.Getenv("ISSUER_ED25519_PUBLIC_KEY_HEX"); rawHex != "" {
+		raw, err := hex.DecodeString(rawHex)
+		if err == nil && len(raw) == ed25519.PublicKeySize {
+			return ed25519.PublicKey(raw)
+		}
+	}
+	return issuerPrivateKey().Public().(ed25519.PublicKey)
+}
+
+func defaultIssuerEd25519Seed() []byte {
+	seed, _ := hex.DecodeString("298754db2dbab6ec62605ceb0379eb7ee376580359449efe0caa3aa06cd56736")
+	return seed
+}
+
+func defaultIssuerDID() string {
+	return didKeyFromPublicKey(issuerPublicKey())
+}
+
+func didKeyFromPublicKey(publicKey ed25519.PublicKey) string {
+	prefixed := append([]byte{0xed, 0x01}, publicKey...)
+	return "did:key:z" + base58Encode(prefixed)
+}
+
+func base58Encode(raw []byte) string {
+	const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+	if len(raw) == 0 {
+		return ""
+	}
+
+	digits := []byte{0}
+	for _, b := range raw {
+		carry := int(b)
+		for j := len(digits) - 1; j >= 0; j-- {
+			carry += int(digits[j]) << 8
+			digits[j] = byte(carry % 58)
+			carry /= 58
+		}
+		for carry > 0 {
+			digits = append([]byte{byte(carry % 58)}, digits...)
+			carry /= 58
+		}
+	}
+
+	for _, b := range raw {
+		if b == 0 {
+			digits = append([]byte{0}, digits...)
+			continue
+		}
+		break
+	}
+
+	out := make([]byte, len(digits))
+	for i, digit := range digits {
+		out[i] = alphabet[digit]
+	}
+	return string(out)
+}
+
+func hasType(cred Credential, kind string) bool {
+	for _, t := range cred.Type {
+		if t == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func isSubset(requested, allowed []string) bool {

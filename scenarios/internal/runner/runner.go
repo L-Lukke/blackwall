@@ -14,6 +14,7 @@ import (
 type Config struct {
 	IssuerURL      string
 	GatewayURL     string
+	WalletURL      string
 	AuthzHealthURL string
 	LockURL        string
 	SensorURL      string
@@ -31,26 +32,42 @@ type Client struct {
 }
 
 type Proof struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+	Type               string `json:"type"`
+	Cryptosuite        string `json:"cryptosuite"`
+	Created            string `json:"created"`
+	VerificationMethod string `json:"verificationMethod"`
+	ProofPurpose       string `json:"proofPurpose"`
+	ProofValue         string `json:"proofValue"`
 }
 
 type Credential struct {
+	Context           []string          `json:"@context"`
+	ID                string            `json:"id"`
+	Type              []string          `json:"type"`
+	Issuer            string            `json:"issuer"`
+	ValidFrom         string            `json:"validFrom"`
+	ValidUntil        string            `json:"validUntil"`
+	CredentialSubject CredentialSubject `json:"credentialSubject"`
+	CredentialStatus  CredentialStatus  `json:"credentialStatus"`
+	Proof             *Proof            `json:"proof,omitempty"`
+}
+
+type CredentialSubject struct {
 	ID                   string   `json:"id"`
-	Type                 string   `json:"type"`
-	Issuer               string   `json:"issuer"`
-	Subject              string   `json:"subject"`
 	Gateway              string   `json:"gateway"`
-	DeviceScopes         []string `json:"device_scopes"`
-	ActionScopes         []string `json:"action_scopes"`
-	DelegatedBy          string   `json:"delegated_by,omitempty"`
-	ParentCredentialID   string   `json:"parent_credential_id,omitempty"`
-	TransferredBy        string   `json:"transferred_by,omitempty"`
-	ReplacesCredentialID string   `json:"replaces_credential_id,omitempty"`
-	IssuedAt             string   `json:"issued_at"`
-	ExpiresAt            string   `json:"expires_at"`
-	Status               string   `json:"status"`
-	Proof                Proof    `json:"proof"`
+	DeviceScopes         []string `json:"deviceScopes"`
+	ActionScopes         []string `json:"actionScopes"`
+	DelegatedBy          string   `json:"delegatedBy,omitempty"`
+	ParentCredentialID   string   `json:"parentCredentialId,omitempty"`
+	TransferredBy        string   `json:"transferredBy,omitempty"`
+	ReplacesCredentialID string   `json:"replacesCredentialId,omitempty"`
+}
+
+type CredentialStatus struct {
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	StatusPurpose string `json:"statusPurpose"`
+	Status        string `json:"status"`
 }
 
 type OwnerCredentialRequest struct {
@@ -92,10 +109,58 @@ type TransferOwnershipResponse struct {
 }
 
 type AccessRequest struct {
-	Subject    string     `json:"subject"`
-	DeviceID   string     `json:"device_id"`
-	Action     string     `json:"action"`
+	Subject      string                  `json:"subject"`
+	DeviceID     string                  `json:"device_id"`
+	Action       string                  `json:"action"`
+	Credential   *Credential             `json:"credential,omitempty"`
+	Challenge    string                  `json:"challenge,omitempty"`
+	Presentation *VerifiablePresentation `json:"presentation,omitempty"`
+}
+
+type VerifiablePresentation struct {
+	Context              []string     `json:"@context"`
+	ID                   string       `json:"id"`
+	Type                 []string     `json:"type"`
+	Holder               string       `json:"holder"`
+	VerifiableCredential []Credential `json:"verifiableCredential"`
+	Proof                *VPProof     `json:"proof,omitempty"`
+}
+
+type VPProof struct {
+	Type               string `json:"type"`
+	Cryptosuite        string `json:"cryptosuite"`
+	Created            string `json:"created"`
+	VerificationMethod string `json:"verificationMethod"`
+	ProofPurpose       string `json:"proofPurpose"`
+	Challenge          string `json:"challenge"`
+	Domain             string `json:"domain"`
+	ProofValue         string `json:"proofValue"`
+}
+
+type ChallengeRequest struct {
+	Subject  string `json:"subject"`
+	DeviceID string `json:"device_id"`
+	Action   string `json:"action"`
+}
+
+type ChallengeResponse struct {
+	Challenge string `json:"challenge"`
+	Domain    string `json:"domain"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+type WalletDIDResponse struct {
+	DID string `json:"did"`
+}
+
+type StoreCredentialRequest struct {
 	Credential Credential `json:"credential"`
+}
+
+type PresentationRequest struct {
+	CredentialID string `json:"credential_id,omitempty"`
+	Challenge    string `json:"challenge"`
+	Domain       string `json:"domain"`
 }
 
 type GatewayAccessResponse struct {
@@ -129,6 +194,7 @@ func LoadConfig() Config {
 	return Config{
 		IssuerURL:      getenv("ISSUER_URL", "http://127.0.0.1:8082"),
 		GatewayURL:     getenv("GATEWAY_URL", "http://127.0.0.1:8080"),
+		WalletURL:      getenv("WALLET_URL", "http://127.0.0.1:8083"),
 		AuthzHealthURL: getenv("AUTHZ_HEALTH_URL", "http://127.0.0.1:8081"),
 		LockURL:        getenv("LOCK_URL", "http://127.0.0.1:8090"),
 		SensorURL:      getenv("SENSOR_URL", "http://127.0.0.1:8091"),
@@ -154,11 +220,59 @@ func (c *Client) CheckHealth() []ServiceHealth {
 	return []ServiceHealth{
 		c.checkOne("issuer", c.cfg.IssuerURL+"/health"),
 		c.checkOne("gateway", c.cfg.GatewayURL+"/health"),
+		c.checkOne("wallet", c.cfg.WalletURL+"/health"),
 		c.checkOne("authz", c.cfg.AuthzHealthURL+"/health"),
 		c.checkOne("lock-sim", c.cfg.LockURL+"/health"),
 		c.checkOne("sensor-sim", c.cfg.SensorURL+"/health"),
 		c.checkOne("light-sim", c.cfg.LightURL+"/health"),
 	}
+}
+
+func (c *Client) RunVPChallengeFlow() ScenarioResult {
+	start := time.Now()
+	result := ScenarioResult{Name: "vp-challenge"}
+
+	holderDID, err := c.walletDID()
+	if err != nil {
+		return fail(result, start, "resolve wallet did failed", err)
+	}
+	result.Steps = append(result.Steps, "wallet holder did="+holderDID)
+
+	owner, err := c.issueOwnerCredentialForDevice(holderDID, c.cfg.DeviceID, []string{"unlock"})
+	if err != nil {
+		return fail(result, start, "issue owner credential failed", err)
+	}
+	result.Steps = append(result.Steps, "issued owner credential id="+owner.ID)
+
+	if err := c.storeCredentialInWallet(owner); err != nil {
+		return fail(result, start, "store credential in wallet failed", err)
+	}
+	result.Steps = append(result.Steps, "stored credential in holder wallet")
+
+	challenge, err := c.requestChallenge(holderDID, c.cfg.DeviceID, "unlock")
+	if err != nil {
+		return fail(result, start, "request gateway challenge failed", err)
+	}
+	result.Steps = append(result.Steps, "gateway challenge issued")
+
+	presentation, err := c.createPresentation(owner.ID, challenge.Challenge, challenge.Domain)
+	if err != nil {
+		return fail(result, start, "create presentation failed", err)
+	}
+	result.Steps = append(result.Steps, "wallet signed verifiable presentation id="+presentation.ID)
+
+	allowResp, err := c.accessDeviceWithPresentation(holderDID, c.cfg.DeviceID, "unlock", challenge.Challenge, presentation, http.StatusOK)
+	if err != nil {
+		return fail(result, start, "vp access request failed", err)
+	}
+	if !allowResp.Allowed || allowResp.Reason != "allowed_by_owner_credential" {
+		return fail(result, start, "unexpected vp-challenge outcome", fmt.Errorf("allowed=%v reason=%s", allowResp.Allowed, allowResp.Reason))
+	}
+	result.Steps = append(result.Steps, "vp unlock allowed with reason="+allowResp.Reason)
+
+	result.Passed = true
+	result.Duration = time.Since(start)
+	return result
 }
 
 func (c *Client) checkOne(name, url string) ServiceHealth {
@@ -460,12 +574,98 @@ func (c *Client) accessDevice(subject, deviceID, action string, cred Credential,
 			Subject:    subject,
 			DeviceID:   deviceID,
 			Action:     action,
-			Credential: cred,
+			Credential: &cred,
 		},
 		&out,
 		expectedStatus,
 	)
 	return out, err
+}
+
+func (c *Client) accessDeviceWithPresentation(subject, deviceID, action, challenge string, presentation VerifiablePresentation, expectedStatus int) (GatewayAccessResponse, error) {
+	var out GatewayAccessResponse
+	err := c.postJSON(
+		c.cfg.GatewayURL+"/access/request",
+		AccessRequest{
+			Subject:      subject,
+			DeviceID:     deviceID,
+			Action:       action,
+			Challenge:    challenge,
+			Presentation: &presentation,
+		},
+		&out,
+		expectedStatus,
+	)
+	return out, err
+}
+
+func (c *Client) walletDID() (string, error) {
+	var out WalletDIDResponse
+	if err := c.getJSON(c.cfg.WalletURL+"/wallet/did", &out); err != nil {
+		return "", err
+	}
+	return out.DID, nil
+}
+
+func (c *Client) storeCredentialInWallet(cred Credential) error {
+	var out map[string]any
+	return c.postJSON(
+		c.cfg.WalletURL+"/wallet/credentials",
+		StoreCredentialRequest{Credential: cred},
+		&out,
+		http.StatusOK,
+	)
+}
+
+func (c *Client) requestChallenge(subject, deviceID, action string) (ChallengeResponse, error) {
+	var out ChallengeResponse
+	err := c.postJSON(
+		c.cfg.GatewayURL+"/access/challenge",
+		ChallengeRequest{Subject: subject, DeviceID: deviceID, Action: action},
+		&out,
+		http.StatusOK,
+	)
+	return out, err
+}
+
+func (c *Client) createPresentation(credentialID, challenge, domain string) (VerifiablePresentation, error) {
+	var out VerifiablePresentation
+	err := c.postJSON(
+		c.cfg.WalletURL+"/wallet/presentations",
+		PresentationRequest{CredentialID: credentialID, Challenge: challenge, Domain: domain},
+		&out,
+		http.StatusOK,
+	)
+	return out, err
+}
+
+func (c *Client) getJSON(url string, out any) error {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("status=%d body=%s", resp.StatusCode, string(body))
+	}
+	if out == nil || len(body) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("decode response failed: %w body=%s", err, string(body))
+	}
+	return nil
 }
 
 func (c *Client) postJSON(url string, in any, out any, expectedStatus int) error {

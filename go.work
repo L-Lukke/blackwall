@@ -5,6 +5,7 @@ use (
 	./devices/lock-sim
 	./devices/sensor-sim
 	./gateway/go-api
+	./holder/go-wallet
 	./issuer/go-issuer
 	./scenarios
 )

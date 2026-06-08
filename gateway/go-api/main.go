@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,33 +16,83 @@ import (
 )
 
 type Proof struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+	Type               string `json:"type"`
+	Cryptosuite        string `json:"cryptosuite"`
+	Created            string `json:"created"`
+	VerificationMethod string `json:"verificationMethod"`
+	ProofPurpose       string `json:"proofPurpose"`
+	ProofValue         string `json:"proofValue"`
 }
 
 type Credential struct {
+	Context           []string          `json:"@context"`
+	ID                string            `json:"id"`
+	Type              []string          `json:"type"`
+	Issuer            string            `json:"issuer"`
+	ValidFrom         string            `json:"validFrom"`
+	ValidUntil        string            `json:"validUntil"`
+	CredentialSubject CredentialSubject `json:"credentialSubject"`
+	CredentialStatus  CredentialStatus  `json:"credentialStatus"`
+	Proof             *Proof            `json:"proof,omitempty"`
+}
+
+type CredentialSubject struct {
 	ID                   string   `json:"id"`
-	Type                 string   `json:"type"`
-	Issuer               string   `json:"issuer"`
-	Subject              string   `json:"subject"`
 	Gateway              string   `json:"gateway"`
-	DeviceScopes         []string `json:"device_scopes"`
-	ActionScopes         []string `json:"action_scopes"`
-	DelegatedBy          string   `json:"delegated_by,omitempty"`
-	ParentCredentialID   string   `json:"parent_credential_id,omitempty"`
-	TransferredBy        string   `json:"transferred_by,omitempty"`
-	ReplacesCredentialID string   `json:"replaces_credential_id,omitempty"`
-	IssuedAt             string   `json:"issued_at"`
-	ExpiresAt            string   `json:"expires_at"`
-	Status               string   `json:"status"`
-	Proof                Proof    `json:"proof"`
+	DeviceScopes         []string `json:"deviceScopes"`
+	ActionScopes         []string `json:"actionScopes"`
+	DelegatedBy          string   `json:"delegatedBy,omitempty"`
+	ParentCredentialID   string   `json:"parentCredentialId,omitempty"`
+	TransferredBy        string   `json:"transferredBy,omitempty"`
+	ReplacesCredentialID string   `json:"replacesCredentialId,omitempty"`
+}
+
+type CredentialStatus struct {
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	StatusPurpose string `json:"statusPurpose"`
+	Status        string `json:"status"`
 }
 
 type AccessRequest struct {
-	Subject    string     `json:"subject"`
-	DeviceID   string     `json:"device_id"`
-	Action     string     `json:"action"`
-	Credential Credential `json:"credential"`
+	Subject      string                  `json:"subject"`
+	DeviceID     string                  `json:"device_id"`
+	Action       string                  `json:"action"`
+	Credential   *Credential             `json:"credential,omitempty"`
+	Challenge    string                  `json:"challenge,omitempty"`
+	Presentation *VerifiablePresentation `json:"presentation,omitempty"`
+}
+
+type VerifiablePresentation struct {
+	Context              []string     `json:"@context"`
+	ID                   string       `json:"id"`
+	Type                 []string     `json:"type"`
+	Holder               string       `json:"holder"`
+	VerifiableCredential []Credential `json:"verifiableCredential"`
+	Proof                *VPProof     `json:"proof,omitempty"`
+}
+
+type VPProof struct {
+	Type               string `json:"type"`
+	Cryptosuite        string `json:"cryptosuite"`
+	Created            string `json:"created"`
+	VerificationMethod string `json:"verificationMethod"`
+	ProofPurpose       string `json:"proofPurpose"`
+	Challenge          string `json:"challenge"`
+	Domain             string `json:"domain"`
+	ProofValue         string `json:"proofValue"`
+}
+
+type ChallengeRequest struct {
+	Subject  string `json:"subject"`
+	DeviceID string `json:"device_id"`
+	Action   string `json:"action"`
+}
+
+type ChallengeResponse struct {
+	Challenge string `json:"challenge"`
+	Domain    string `json:"domain"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 type AuthzResponse struct {
@@ -77,6 +129,7 @@ type AuditRecord struct {
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/access/challenge", challengeHandler)
 	mux.HandleFunc("/access/request", accessRequestHandler)
 
 	addr := getenv("GATEWAY_ADDR", ":8080")
@@ -86,6 +139,35 @@ func main() {
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func challengeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+
+	var req ChallengeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+		return
+	}
+	if req.Subject == "" || req.DeviceID == "" || req.Action == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_device_id_and_action_required"})
+		return
+	}
+
+	challenge, err := randomHex(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "challenge_generation_failed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ChallengeResponse{
+		Challenge: challenge,
+		Domain:    getenv("GATEWAY_ID", "gateway-home-1"),
+		ExpiresAt: time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339),
+	})
 }
 
 func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +410,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func randomHex(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
 func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string, status int, errText string, persistedTo string) {
 	now := time.Now().UTC()
 
@@ -337,14 +427,14 @@ func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string,
 		Subject:              req.Subject,
 		DeviceID:             req.DeviceID,
 		Action:               req.Action,
-		CredentialID:         req.Credential.ID,
-		CredentialType:       req.Credential.Type,
-		CredentialIssuer:     req.Credential.Issuer,
-		CredentialSubject:    req.Credential.Subject,
-		DelegatedBy:          req.Credential.DelegatedBy,
-		ParentCredentialID:   req.Credential.ParentCredentialID,
-		TransferredBy:        req.Credential.TransferredBy,
-		ReplacesCredentialID: req.Credential.ReplacesCredentialID,
+		CredentialID:         credentialID(req),
+		CredentialType:       credentialType(req),
+		CredentialIssuer:     credentialIssuer(req),
+		CredentialSubject:    credentialSubject(req),
+		DelegatedBy:          credentialDelegatedBy(req),
+		ParentCredentialID:   credentialParentID(req),
+		TransferredBy:        credentialTransferredBy(req),
+		ReplacesCredentialID: credentialReplacesID(req),
 		Outcome:              outcome,
 		HTTPStatus:           status,
 		Error:                errText,
@@ -368,4 +458,76 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func credentialFromRequest(req AccessRequest) *Credential {
+	if req.Credential != nil {
+		return req.Credential
+	}
+	if req.Presentation != nil && len(req.Presentation.VerifiableCredential) > 0 {
+		return &req.Presentation.VerifiableCredential[0]
+	}
+	return nil
+}
+
+func credentialID(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.ID
+	}
+	return ""
+}
+
+func credentialIssuer(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.Issuer
+	}
+	return ""
+}
+
+func credentialSubject(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.CredentialSubject.ID
+	}
+	return ""
+}
+
+func credentialDelegatedBy(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.CredentialSubject.DelegatedBy
+	}
+	return ""
+}
+
+func credentialParentID(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.CredentialSubject.ParentCredentialID
+	}
+	return ""
+}
+
+func credentialTransferredBy(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.CredentialSubject.TransferredBy
+	}
+	return ""
+}
+
+func credentialReplacesID(req AccessRequest) string {
+	if cred := credentialFromRequest(req); cred != nil {
+		return cred.CredentialSubject.ReplacesCredentialID
+	}
+	return ""
+}
+
+func credentialType(req AccessRequest) string {
+	cred := credentialFromRequest(req)
+	if cred == nil {
+		return ""
+	}
+	for _, t := range cred.Type {
+		if t != "VerifiableCredential" {
+			return t
+		}
+	}
+	return ""
 }
