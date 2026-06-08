@@ -5,6 +5,8 @@
 
 This repository contains a **software-only proof of concept (PoC)** for a **gateway-based smart home architecture** that uses **Self-Sovereign Identity (SSI)** concepts to improve **user sovereignty** over device access and household data.
 
+The main architectural choices are recorded in [ADR 0001: Gateway-Mediated SSI Proof of Concept](docs/adr/0001-gateway-mediated-ssi-poc.md).
+
 The PoC is designed around five main components:
 
 - **Gateway API (Go):** receives access requests and mediates communication with devices
@@ -16,6 +18,34 @@ The PoC is designed around five main components:
 The main architectural goal is to demonstrate that **smart devices do not need to implement SSI directly**. Instead, a **locally controlled gateway** handles identity and authorization logic on their behalf.
 
 ---
+
+## Simple architecture diagram
+
+
+```mermaid
+flowchart LR
+    Issuer["Issuer Service<br/>(Go)<br/>Issues VC credentials"]
+    Wallet["Holder Wallet<br/>(Go)<br/>Stores VC + signs VP"]
+    Gateway["Gateway API<br/>(Go)<br/>Challenges + mediates access"]
+    Authz["Authorization Service<br/>(Rust)<br/>Verifies VP/VC + policy"]
+    Resolver["DID Resolver Boundary<br/>did:key -> DID Document"]
+    Policy["Local Policy Fixture<br/>testdata/policies/devices.json"]
+    Revocation["Revocation Fixture<br/>testdata/revocations/revoked_ids.json"]
+    Devices["Device Simulators<br/>Lock / Light / Sensor"]
+
+    Issuer -- "1. Issue VC to holder did:key" --> Wallet
+    Wallet -- "2. Request access challenge" --> Gateway
+    Gateway -- "3. Return challenge + domain" --> Wallet
+    Wallet -- "4. Submit signed VP containing VC" --> Gateway
+    Gateway -- "5. Forward access request + VP" --> Authz
+
+    Authz -- "Resolve issuer + holder keys" --> Resolver
+    Authz -- "Check device/action policy" --> Policy
+    Authz -- "Check credential revocation" --> Revocation
+
+    Authz -- "6. allow / deny" --> Gateway
+    Gateway -- "7. Execute only if allowed" --> Devices
+```
 
 ## Implemented / To be implemented
 
@@ -43,7 +73,7 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 
 - Local policy management and richer household rules
 - Integration tests, scenario tests, and performance measurements
-- ADRs, API documentation, scripts, and CI workflows
+- API documentation, scripts, and CI workflows
 
 ---
 
