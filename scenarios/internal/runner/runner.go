@@ -2,12 +2,14 @@ package runner
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"time"
 )
 
@@ -78,28 +80,31 @@ type OwnerCredentialRequest struct {
 }
 
 type DelegationCredentialRequest struct {
-	DelegatedBy     string     `json:"delegated_by"`
-	Subject         string     `json:"subject"`
-	Gateway         string     `json:"gateway"`
-	DeviceScopes    []string   `json:"device_scopes"`
-	ActionScopes    []string   `json:"action_scopes"`
-	TTLMinutes      int        `json:"ttl_minutes"`
-	OwnerCredential Credential `json:"owner_credential"`
+	DelegatedBy       string                 `json:"delegated_by"`
+	Subject           string                 `json:"subject"`
+	Gateway           string                 `json:"gateway"`
+	DeviceScopes      []string               `json:"device_scopes"`
+	ActionScopes      []string               `json:"action_scopes"`
+	TTLMinutes        int                    `json:"ttl_minutes"`
+	Challenge         string                 `json:"challenge"`
+	OwnerPresentation VerifiablePresentation `json:"owner_presentation"`
 }
 
 type RevokeCredentialRequest struct {
-	CredentialID    string     `json:"credential_id"`
-	RevokedBy       string     `json:"revoked_by"`
-	OwnerCredential Credential `json:"owner_credential"`
+	CredentialID      string                 `json:"credential_id"`
+	RevokedBy         string                 `json:"revoked_by"`
+	Challenge         string                 `json:"challenge"`
+	OwnerPresentation VerifiablePresentation `json:"owner_presentation"`
 }
 
 type TransferOwnershipRequest struct {
-	TransferredBy   string     `json:"transferred_by"`
-	NewSubject      string     `json:"new_subject"`
-	Gateway         string     `json:"gateway"`
-	DeviceScopes    []string   `json:"device_scopes,omitempty"`
-	ActionScopes    []string   `json:"action_scopes,omitempty"`
-	OwnerCredential Credential `json:"owner_credential"`
+	TransferredBy     string                 `json:"transferred_by"`
+	NewSubject        string                 `json:"new_subject"`
+	Gateway           string                 `json:"gateway"`
+	DeviceScopes      []string               `json:"device_scopes,omitempty"`
+	ActionScopes      []string               `json:"action_scopes,omitempty"`
+	Challenge         string                 `json:"challenge"`
+	OwnerPresentation VerifiablePresentation `json:"owner_presentation"`
 }
 
 type TransferOwnershipResponse struct {
@@ -112,7 +117,6 @@ type AccessRequest struct {
 	Subject      string                  `json:"subject"`
 	DeviceID     string                  `json:"device_id"`
 	Action       string                  `json:"action"`
-	Credential   *Credential             `json:"credential,omitempty"`
 	Challenge    string                  `json:"challenge,omitempty"`
 	Presentation *VerifiablePresentation `json:"presentation,omitempty"`
 }
@@ -147,6 +151,11 @@ type ChallengeResponse struct {
 	Challenge string `json:"challenge"`
 	Domain    string `json:"domain"`
 	ExpiresAt string `json:"expires_at"`
+}
+
+type IssuerChallengeRequest struct {
+	Subject   string `json:"subject"`
+	Operation string `json:"operation"`
 }
 
 type WalletDIDResponse struct {
@@ -189,6 +198,8 @@ type ScenarioResult struct {
 type Revocations struct {
 	RevokedIDs []string `json:"revoked_ids"`
 }
+
+var scenarioActorKeys = map[string]ed25519.PrivateKey{}
 
 func LoadConfig() Config {
 	return Config{
@@ -516,17 +527,23 @@ func (c *Client) issueOwnerCredentialForDevice(subject, deviceID string, actions
 }
 
 func (c *Client) issueDelegationCredentialForDevice(delegatedBy, subject string, owner Credential, deviceID string, actions []string, ttlMinutes int) (Credential, error) {
+	challenge, presentation, err := c.ownerPresentationForIssuer(delegatedBy, "delegation", owner)
+	if err != nil {
+		return Credential{}, err
+	}
+
 	var cred Credential
-	err := c.postJSON(
+	err = c.postJSON(
 		c.cfg.IssuerURL+"/credentials/delegation",
 		DelegationCredentialRequest{
-			DelegatedBy:     delegatedBy,
-			Subject:         subject,
-			Gateway:         c.cfg.GatewayID,
-			DeviceScopes:    []string{deviceID},
-			ActionScopes:    actions,
-			TTLMinutes:      ttlMinutes,
-			OwnerCredential: owner,
+			DelegatedBy:       delegatedBy,
+			Subject:           subject,
+			Gateway:           c.cfg.GatewayID,
+			DeviceScopes:      []string{deviceID},
+			ActionScopes:      actions,
+			TTLMinutes:        ttlMinutes,
+			Challenge:         challenge.Challenge,
+			OwnerPresentation: presentation,
 		},
 		&cred,
 		http.StatusOK,
@@ -535,13 +552,19 @@ func (c *Client) issueDelegationCredentialForDevice(delegatedBy, subject string,
 }
 
 func (c *Client) revokeCredentialViaIssuer(credentialID, revokedBy string, ownerCredential Credential) error {
+	challenge, presentation, err := c.ownerPresentationForIssuer(revokedBy, "revocation", ownerCredential)
+	if err != nil {
+		return err
+	}
+
 	var out map[string]any
 	return c.postJSON(
 		c.cfg.IssuerURL+"/credentials/revoke",
 		RevokeCredentialRequest{
-			CredentialID:    credentialID,
-			RevokedBy:       revokedBy,
-			OwnerCredential: ownerCredential,
+			CredentialID:      credentialID,
+			RevokedBy:         revokedBy,
+			Challenge:         challenge.Challenge,
+			OwnerPresentation: presentation,
 		},
 		&out,
 		http.StatusOK,
@@ -549,16 +572,22 @@ func (c *Client) revokeCredentialViaIssuer(credentialID, revokedBy string, owner
 }
 
 func (c *Client) transferOwnershipForDevice(transferredBy, newSubject string, ownerCredential Credential, deviceScopes, actionScopes []string) (TransferOwnershipResponse, error) {
+	challenge, presentation, err := c.ownerPresentationForIssuer(transferredBy, "transfer", ownerCredential)
+	if err != nil {
+		return TransferOwnershipResponse{}, err
+	}
+
 	var out TransferOwnershipResponse
-	err := c.postJSON(
+	err = c.postJSON(
 		c.cfg.IssuerURL+"/credentials/transfer",
 		TransferOwnershipRequest{
-			TransferredBy:   transferredBy,
-			NewSubject:      newSubject,
-			Gateway:         c.cfg.GatewayID,
-			DeviceScopes:    deviceScopes,
-			ActionScopes:    actionScopes,
-			OwnerCredential: ownerCredential,
+			TransferredBy:     transferredBy,
+			NewSubject:        newSubject,
+			Gateway:           c.cfg.GatewayID,
+			DeviceScopes:      deviceScopes,
+			ActionScopes:      actionScopes,
+			Challenge:         challenge.Challenge,
+			OwnerPresentation: presentation,
 		},
 		&out,
 		http.StatusOK,
@@ -566,20 +595,40 @@ func (c *Client) transferOwnershipForDevice(transferredBy, newSubject string, ow
 	return out, err
 }
 
+func (c *Client) ownerPresentationForIssuer(subject, operation string, cred Credential) (ChallengeResponse, VerifiablePresentation, error) {
+	if cred.CredentialSubject.ID != subject {
+		return ChallengeResponse{}, VerifiablePresentation{}, fmt.Errorf("credential subject %s does not match issuer subject %s", cred.CredentialSubject.ID, subject)
+	}
+
+	challenge, err := c.requestIssuerChallenge(subject, operation)
+	if err != nil {
+		return ChallengeResponse{}, VerifiablePresentation{}, err
+	}
+
+	presentation, err := createScenarioPresentation(subject, cred, challenge.Challenge, challenge.Domain)
+	if err != nil {
+		return ChallengeResponse{}, VerifiablePresentation{}, err
+	}
+
+	return challenge, presentation, nil
+}
+
 func (c *Client) accessDevice(subject, deviceID, action string, cred Credential, expectedStatus int) (GatewayAccessResponse, error) {
-	var out GatewayAccessResponse
-	err := c.postJSON(
-		c.cfg.GatewayURL+"/access/request",
-		AccessRequest{
-			Subject:    subject,
-			DeviceID:   deviceID,
-			Action:     action,
-			Credential: &cred,
-		},
-		&out,
-		expectedStatus,
-	)
-	return out, err
+	if cred.CredentialSubject.ID != subject {
+		return GatewayAccessResponse{}, fmt.Errorf("credential subject %s does not match access subject %s", cred.CredentialSubject.ID, subject)
+	}
+
+	challenge, err := c.requestChallenge(subject, deviceID, action)
+	if err != nil {
+		return GatewayAccessResponse{}, err
+	}
+
+	presentation, err := createScenarioPresentation(subject, cred, challenge.Challenge, challenge.Domain)
+	if err != nil {
+		return GatewayAccessResponse{}, err
+	}
+
+	return c.accessDeviceWithPresentation(subject, deviceID, action, challenge.Challenge, presentation, expectedStatus)
 }
 
 func (c *Client) accessDeviceWithPresentation(subject, deviceID, action, challenge string, presentation VerifiablePresentation, expectedStatus int) (GatewayAccessResponse, error) {
@@ -622,6 +671,17 @@ func (c *Client) requestChallenge(subject, deviceID, action string) (ChallengeRe
 	err := c.postJSON(
 		c.cfg.GatewayURL+"/access/challenge",
 		ChallengeRequest{Subject: subject, DeviceID: deviceID, Action: action},
+		&out,
+		http.StatusOK,
+	)
+	return out, err
+}
+
+func (c *Client) requestIssuerChallenge(subject, operation string) (ChallengeResponse, error) {
+	var out ChallengeResponse
+	err := c.postJSON(
+		c.cfg.IssuerURL+"/credentials/challenge",
+		IssuerChallengeRequest{Subject: subject, Operation: operation},
 		&out,
 		http.StatusOK,
 	)
@@ -726,19 +786,6 @@ func IssueDelegationCredentialForDevice(cfg Config, deviceID, delegatedBy, subje
 	return cred
 }
 
-func RevokeCredential(cfg Config, credentialID, revokedBy string) {
-	path := getenv("REVOCATION_FILE", "../../testdata/revocations/revoked_ids.json")
-	revocations, err := loadRevocations(path)
-	must(err)
-
-	if !contains(revocations.RevokedIDs, credentialID) {
-		revocations.RevokedIDs = append(revocations.RevokedIDs, credentialID)
-		sort.Strings(revocations.RevokedIDs)
-	}
-
-	must(saveRevocations(path, revocations))
-}
-
 func RevokeCredentialViaIssuer(cfg Config, credentialID, revokedBy string, ownerCredential Credential) {
 	c := New(cfg)
 	must(c.revokeCredentialViaIssuer(credentialID, revokedBy, ownerCredential))
@@ -799,6 +846,10 @@ func ExpectPersisted(resp GatewayAccessResponse) {
 	}
 }
 
+func ActorDID(name string) string {
+	return scenarioActor(name)
+}
+
 func loadRevocations(path string) (Revocations, error) {
 	var out Revocations
 
@@ -851,7 +902,98 @@ func fail(result ScenarioResult, start time.Time, step string, err error) Scenar
 }
 
 func uniqueDID(name string) string {
-	return fmt.Sprintf("did:example:%s-%d", name, time.Now().UnixNano())
+	return scenarioActor(name)
+}
+
+func scenarioActor(name string) string {
+	seed := sha256.Sum256([]byte("blackwall-scenario-actor:" + name))
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	did := didKeyFromPublicKey(publicKey)
+	scenarioActorKeys[did] = privateKey
+	return did
+}
+
+func createScenarioPresentation(subject string, cred Credential, challenge, domain string) (VerifiablePresentation, error) {
+	privateKey, ok := scenarioActorKeys[subject]
+	if !ok {
+		return VerifiablePresentation{}, fmt.Errorf("no scenario signing key for subject %s", subject)
+	}
+
+	now := time.Now().UTC()
+	vp := VerifiablePresentation{
+		Context: []string{
+			"https://www.w3.org/ns/credentials/v2",
+			"https://blackwall.local/contexts/smart-home-presentation/v1",
+		},
+		ID:                   fmt.Sprintf("urn:uuid:vp-%d", now.UnixNano()),
+		Type:                 []string{"VerifiablePresentation"},
+		Holder:               subject,
+		VerifiableCredential: []Credential{cred},
+	}
+
+	signature := ed25519.Sign(privateKey, presentationSigningInput(vp))
+	vp.Proof = &VPProof{
+		Type:               "DataIntegrityProof",
+		Cryptosuite:        "eddsa-rdfc-2022",
+		Created:            now.Format(time.RFC3339),
+		VerificationMethod: subject + "#key-1",
+		ProofPurpose:       "authentication",
+		Challenge:          challenge,
+		Domain:             domain,
+		ProofValue:         hex.EncodeToString(signature),
+	}
+
+	return vp, nil
+}
+
+func presentationSigningInput(vp VerifiablePresentation) []byte {
+	vp.Proof = nil
+	raw, err := json.Marshal(vp)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func didKeyFromPublicKey(publicKey ed25519.PublicKey) string {
+	prefixed := append([]byte{0xed, 0x01}, publicKey...)
+	return "did:key:z" + base58Encode(prefixed)
+}
+
+func base58Encode(raw []byte) string {
+	const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+	if len(raw) == 0 {
+		return ""
+	}
+
+	digits := []byte{0}
+	for _, b := range raw {
+		carry := int(b)
+		for j := len(digits) - 1; j >= 0; j-- {
+			carry += int(digits[j]) << 8
+			digits[j] = byte(carry % 58)
+			carry /= 58
+		}
+		for carry > 0 {
+			digits = append([]byte{byte(carry % 58)}, digits...)
+			carry /= 58
+		}
+	}
+
+	for _, b := range raw {
+		if b == 0 {
+			digits = append([]byte{0}, digits...)
+			continue
+		}
+		break
+	}
+
+	out := make([]byte, len(digits))
+	for i, digit := range digits {
+		out[i] = alphabet[digit]
+	}
+	return string(out)
 }
 
 func getenv(key, fallback string) string {

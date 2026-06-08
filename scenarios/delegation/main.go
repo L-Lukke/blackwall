@@ -8,8 +8,8 @@ import (
 
 func main() {
 	cfg := runner.LoadConfig()
-	alice := "did:example:alice"
-	bob := "did:example:bob"
+	alice := runner.ActorDID("alice")
+	bob := runner.ActorDID("bob")
 
 	fmt.Println("[1/4] issuing owner credential for Alice")
 	owner := runner.IssueOwnerCredential(cfg, alice, "unlock", "lock")

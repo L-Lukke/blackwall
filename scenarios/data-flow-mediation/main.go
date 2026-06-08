@@ -9,7 +9,7 @@ import (
 
 func main() {
 	cfg := runner.LoadConfig()
-	alice := "did:example:alice"
+	alice := runner.ActorDID("alice")
 
 	fmt.Println("[1/3] issuing owner credential for Alice for the mediated sensor")
 	owner := runner.IssueOwnerCredentialForDevice(cfg, cfg.SensorDeviceID, alice, "read_sensor")

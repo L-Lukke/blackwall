@@ -8,8 +8,8 @@ import (
 
 func main() {
 	cfg := runner.LoadConfig()
-	alice := "did:example:alice"
-	bob := "did:example:bob"
+	alice := runner.ActorDID("alice")
+	bob := runner.ActorDID("bob")
 
 	fmt.Println("[1/5] issuing owner credential for Alice")
 	owner := runner.IssueOwnerCredential(cfg, alice, "unlock", "lock")
@@ -25,7 +25,7 @@ func main() {
 	fmt.Printf("  result: allowed=%v reason=%s\n", before.Allowed, before.Reason)
 
 	fmt.Println("[4/5] revoking Bob's delegation credential")
-	runner.RevokeCredential(cfg, delegation.ID, "manual_test_revocation")
+	runner.RevokeCredentialViaIssuer(cfg, delegation.ID, alice, owner)
 	fmt.Printf("  revoked credential id: %s\n", delegation.ID)
 
 	fmt.Println("[5/5] Bob unlocks after revocation")

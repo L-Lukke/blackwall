@@ -63,7 +63,6 @@ type AccessRequest struct {
 	Subject      string                  `json:"subject"`
 	DeviceID     string                  `json:"device_id"`
 	Action       string                  `json:"action"`
-	Credential   *Credential             `json:"credential,omitempty"`
 	Challenge    string                  `json:"challenge,omitempty"`
 	Presentation *VerifiablePresentation `json:"presentation,omitempty"`
 }
@@ -211,20 +210,28 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req AccessRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		appendAuditLog(AccessRequest{}, nil, "bad_json", http.StatusBadRequest, err.Error(), "")
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
 		return
 	}
-	if req.Presentation != nil {
-		if reason := challengeStore.Consume(req); reason != "" {
-			appendAuditLog(req, nil, "challenge_rejected", http.StatusForbidden, reason, "")
-			writeJSON(w, http.StatusForbidden, map[string]any{
-				"allowed": false,
-				"reason":  reason,
-			})
-			return
-		}
+	if req.Presentation == nil {
+		appendAuditLog(req, nil, "presentation_required", http.StatusForbidden, "", "")
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"allowed": false,
+			"reason":  "presentation_required",
+		})
+		return
+	}
+	if reason := challengeStore.Consume(req); reason != "" {
+		appendAuditLog(req, nil, "challenge_rejected", http.StatusForbidden, reason, "")
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"allowed": false,
+			"reason":  reason,
+		})
+		return
 	}
 
 	var authzResp AuthzResponse
@@ -562,9 +569,6 @@ func getenv(key, fallback string) string {
 }
 
 func credentialFromRequest(req AccessRequest) *Credential {
-	if req.Credential != nil {
-		return req.Credential
-	}
 	if req.Presentation != nil && len(req.Presentation.VerifiableCredential) > 0 {
 		return &req.Presentation.VerifiableCredential[0]
 	}

@@ -69,6 +69,8 @@ Authorization service: verify VP, VC, revocation, scopes, and policy
 Gateway -> Device simulator: execute only after allow
 ```
 
+Issuer-side authority-changing operations also require challenge-bound owner presentations. Delegation, revocation, and ownership transfer requests carry an owner VP rather than a raw owner credential, so the issuer verifies both the owner credential and holder control of the owner DID before changing authority state.
+
 Use `did:key` for the initial DID method.
 
 `did:key` keeps DID resolution deterministic and local. It avoids adding a registry, web hosting dependency, or external resolver while still providing a real DID method and a DID document/resolver boundary. The authorization service resolves issuer and holder verification methods through a resolver module instead of accepting raw public keys in the access request.
@@ -90,6 +92,7 @@ Revocation is represented by `testdata/revocations/revoked_ids.json`. Device pol
 - The PoC now has recognizable issuer, holder, verifier, and subject roles.
 - `did:key` provides real DID-derived verification keys without network dependencies.
 - Challenge-bound VPs prove holder control of the holder DID key.
+- Issuer-side authority changes prove holder control with challenge-bound owner VPs instead of raw credential submission.
 - One-time challenge consumption gives basic replay protection.
 - Local files keep policy and revocation easy to inspect during demos.
 
@@ -115,6 +118,7 @@ The current VP flow checks:
 - VC subject matches the VP holder.
 - VC issuer matches the trusted issuer DID.
 - VC and VP signatures verify through DID resolution.
+- Delegation, revocation, and ownership-transfer requests use issuer challenges and owner VPs.
 - Credential expiry, revocation, scopes, and local policy are enforced.
 
 The current PoC does not yet provide:

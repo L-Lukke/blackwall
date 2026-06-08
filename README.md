@@ -68,11 +68,12 @@ flowchart LR
 - `did:key` resolution behind a DID document/resolver boundary for issuer and holder verification keys
 - Holder wallet and challenge-bound verifiable presentation flow
 - Stateful VP challenges with expiry, subject/device/action binding, and one-time consumption
+- Issuer-side delegation, revocation, and ownership-transfer operations require challenge-bound owner VPs
 
 ### To be implemented
 
 - Local policy management and richer household rules
-- Integration tests, scenario tests, and performance measurements
+- Automated regression tests and performance measurements
 - API documentation, scripts, and CI workflows
 
 ---
@@ -174,6 +175,7 @@ These logs are runtime output and are intentionally ignored by git.
 #### Delegation
 
 * an owner credential is issued
+* the owner signs an issuer challenge-bound VP proving control of the owner credential
 * a delegated credential is issued for another subject
 * delegated `unlock` is allowed
 * delegated `lock` is denied
@@ -182,9 +184,18 @@ These logs are runtime output and are intentionally ignored by git.
 #### Revocation
 
 * a delegated credential is issued and works before revocation
+* the owner signs an issuer challenge-bound VP authorizing the revocation
 * the issuer revokes that delegated credential
 * the same delegated request is denied afterward
 * expected deny reason: `credential_revoked`
+
+#### Ownership transfer
+
+* an owner credential works before transfer
+* the owner signs an issuer challenge-bound VP authorizing transfer
+* the issuer revokes the previous owner credential and issues a replacement owner credential
+* the previous owner is denied afterward
+* the new owner is allowed afterward
 
 #### VP challenge
 

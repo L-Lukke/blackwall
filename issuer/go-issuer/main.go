@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,8 +12,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+const challengeTTL = 5 * time.Minute
 
 type Proof struct {
 	Type               string `json:"type"`
@@ -20,6 +24,17 @@ type Proof struct {
 	Created            string `json:"created"`
 	VerificationMethod string `json:"verificationMethod"`
 	ProofPurpose       string `json:"proofPurpose"`
+	ProofValue         string `json:"proofValue"`
+}
+
+type PresentationProof struct {
+	Type               string `json:"type"`
+	Cryptosuite        string `json:"cryptosuite"`
+	Created            string `json:"created"`
+	VerificationMethod string `json:"verificationMethod"`
+	ProofPurpose       string `json:"proofPurpose"`
+	Challenge          string `json:"challenge"`
+	Domain             string `json:"domain"`
 	ProofValue         string `json:"proofValue"`
 }
 
@@ -53,6 +68,15 @@ type CredentialStatus struct {
 	Status        string `json:"status"`
 }
 
+type VerifiablePresentation struct {
+	Context              []string           `json:"@context"`
+	ID                   string             `json:"id"`
+	Type                 []string           `json:"type"`
+	Holder               string             `json:"holder"`
+	VerifiableCredential []Credential       `json:"verifiableCredential"`
+	Proof                *PresentationProof `json:"proof,omitempty"`
+}
+
 type OwnerCredentialRequest struct {
 	Subject      string   `json:"subject"`
 	Gateway      string   `json:"gateway"`
@@ -61,37 +85,68 @@ type OwnerCredentialRequest struct {
 }
 
 type DelegationCredentialRequest struct {
-	DelegatedBy     string     `json:"delegated_by"`
-	Subject         string     `json:"subject"`
-	Gateway         string     `json:"gateway"`
-	DeviceScopes    []string   `json:"device_scopes"`
-	ActionScopes    []string   `json:"action_scopes"`
-	TTLMinutes      int        `json:"ttl_minutes"`
-	OwnerCredential Credential `json:"owner_credential"`
+	DelegatedBy       string                 `json:"delegated_by"`
+	Subject           string                 `json:"subject"`
+	Gateway           string                 `json:"gateway"`
+	DeviceScopes      []string               `json:"device_scopes"`
+	ActionScopes      []string               `json:"action_scopes"`
+	TTLMinutes        int                    `json:"ttl_minutes"`
+	Challenge         string                 `json:"challenge"`
+	OwnerPresentation VerifiablePresentation `json:"owner_presentation"`
 }
 
 type RevokeCredentialRequest struct {
-	CredentialID    string     `json:"credential_id"`
-	RevokedBy       string     `json:"revoked_by"`
-	OwnerCredential Credential `json:"owner_credential"`
+	CredentialID      string                 `json:"credential_id"`
+	RevokedBy         string                 `json:"revoked_by"`
+	Challenge         string                 `json:"challenge"`
+	OwnerPresentation VerifiablePresentation `json:"owner_presentation"`
 }
 
 type TransferOwnershipRequest struct {
-	TransferredBy   string     `json:"transferred_by"`
-	NewSubject      string     `json:"new_subject"`
-	Gateway         string     `json:"gateway"`
-	DeviceScopes    []string   `json:"device_scopes,omitempty"`
-	ActionScopes    []string   `json:"action_scopes,omitempty"`
-	OwnerCredential Credential `json:"owner_credential"`
+	TransferredBy     string                 `json:"transferred_by"`
+	NewSubject        string                 `json:"new_subject"`
+	Gateway           string                 `json:"gateway"`
+	DeviceScopes      []string               `json:"device_scopes,omitempty"`
+	ActionScopes      []string               `json:"action_scopes,omitempty"`
+	Challenge         string                 `json:"challenge"`
+	OwnerPresentation VerifiablePresentation `json:"owner_presentation"`
+}
+
+type CredentialChallengeRequest struct {
+	Subject   string `json:"subject"`
+	Operation string `json:"operation"`
+}
+
+type CredentialChallengeResponse struct {
+	Challenge string `json:"challenge"`
+	Domain    string `json:"domain"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+type credentialChallengeRecord struct {
+	Subject   string
+	Operation string
+	Domain    string
+	ExpiresAt time.Time
+}
+
+type credentialChallengeStore struct {
+	mu         sync.Mutex
+	challenges map[string]credentialChallengeRecord
 }
 
 type Revocations struct {
 	RevokedIDs []string `json:"revoked_ids"`
 }
 
+var issuerChallenges = &credentialChallengeStore{
+	challenges: map[string]credentialChallengeRecord{},
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/credentials/challenge", credentialChallengeHandler)
 	mux.HandleFunc("/credentials/owner", ownerCredentialHandler)
 	mux.HandleFunc("/credentials/delegation", delegationCredentialHandler)
 	mux.HandleFunc("/credentials/revoke", revokeCredentialHandler)
@@ -106,6 +161,48 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func credentialChallengeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+
+	var req CredentialChallengeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Subject == "" || req.Operation == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "subject_and_operation_required"})
+		return
+	}
+	if !validCredentialOperation(req.Operation) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported_credential_operation"})
+		return
+	}
+
+	challenge, err := newChallenge()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "challenge_generation_failed"})
+		return
+	}
+
+	domain := getenv("ISSUER_DID", defaultIssuerDID())
+	expiresAt := time.Now().UTC().Add(challengeTTL)
+	issuerChallenges.Put(challenge, credentialChallengeRecord{
+		Subject:   req.Subject,
+		Operation: req.Operation,
+		Domain:    domain,
+		ExpiresAt: expiresAt,
+	})
+
+	writeJSON(w, http.StatusOK, CredentialChallengeResponse{
+		Challenge: challenge,
+		Domain:    domain,
+		ExpiresAt: expiresAt.Format(time.RFC3339),
+	})
+}
+
 func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
@@ -113,8 +210,7 @@ func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req OwnerCredentialRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -142,8 +238,7 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req DelegationCredentialRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -156,27 +251,16 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	owner := req.OwnerCredential
-	if !hasType(owner, "OwnerCredential") {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
+	owner, ok := verifiedOwnerPresentation(w, req.DelegatedBy, "delegation", req.Challenge, req.OwnerPresentation)
+	if !ok {
 		return
 	}
-	if owner.CredentialSubject.ID != req.DelegatedBy {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
-		return
-	}
+
 	if owner.CredentialSubject.Gateway != req.Gateway {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_mismatch"})
 		return
 	}
-	if owner.CredentialStatus.Status != "active" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
-		return
-	}
-	if !verifySignature(owner) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
-		return
-	}
+
 	if !isSubset(req.DeviceScopes, owner.CredentialSubject.DeviceScopes) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device_scopes_not_subset_of_owner"})
 		return
@@ -188,13 +272,13 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 
 	ownerExpiry, err := time.Parse(time.RFC3339, owner.ValidUntil)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_bad_expiry"})
 		return
 	}
 
 	now := time.Now().UTC()
 	if now.After(ownerExpiry) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_expired"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_expired"})
 		return
 	}
 
@@ -224,8 +308,7 @@ func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req RevokeCredentialRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -234,31 +317,18 @@ func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	owner := req.OwnerCredential
-	if !hasType(owner, "OwnerCredential") {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
-		return
-	}
-	if owner.CredentialSubject.ID != req.RevokedBy {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
-		return
-	}
-	if owner.CredentialStatus.Status != "active" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
-		return
-	}
-	if !verifySignature(owner) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
+	owner, ok := verifiedOwnerPresentation(w, req.RevokedBy, "revocation", req.Challenge, req.OwnerPresentation)
+	if !ok {
 		return
 	}
 
 	ownerExpiry, err := time.Parse(time.RFC3339, owner.ValidUntil)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_bad_expiry"})
 		return
 	}
 	if time.Now().UTC().After(ownerExpiry) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_expired"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_expired"})
 		return
 	}
 
@@ -294,8 +364,7 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req TransferOwnershipRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -308,36 +377,24 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	owner := req.OwnerCredential
-	if !hasType(owner, "OwnerCredential") {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_required"})
+	owner, ok := verifiedOwnerPresentation(w, req.TransferredBy, "transfer", req.Challenge, req.OwnerPresentation)
+	if !ok {
 		return
 	}
-	if owner.CredentialSubject.ID != req.TransferredBy {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
-		return
-	}
+
 	if owner.CredentialSubject.Gateway != req.Gateway {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "gateway_mismatch"})
-		return
-	}
-	if owner.CredentialStatus.Status != "active" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_not_active"})
-		return
-	}
-	if !verifySignature(owner) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_signature"})
 		return
 	}
 
 	ownerExpiry, err := time.Parse(time.RFC3339, owner.ValidUntil)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_bad_expiry"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_bad_expiry"})
 		return
 	}
 	now := time.Now().UTC()
 	if now.After(ownerExpiry) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_expired"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_expired"})
 		return
 	}
 
@@ -348,7 +405,7 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if contains(revocations.RevokedIDs, owner.ID) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_credential_already_revoked"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_already_revoked"})
 		return
 	}
 
@@ -390,6 +447,133 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 		"revoked_credential_id": owner.ID,
 		"new_owner_credential":  newCred,
 	})
+}
+
+func verifiedOwnerPresentation(w http.ResponseWriter, subject, operation, challenge string, presentation VerifiablePresentation) (Credential, bool) {
+	if challenge == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "presentation_challenge_required"})
+		return Credential{}, false
+	}
+
+	record, ok := issuerChallenges.Consume(challenge)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_replayed_or_unknown"})
+		return Credential{}, false
+	}
+	if time.Now().UTC().After(record.ExpiresAt) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_expired"})
+		return Credential{}, false
+	}
+	if record.Subject != subject {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_subject_mismatch"})
+		return Credential{}, false
+	}
+	if record.Operation != operation {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_operation_mismatch"})
+		return Credential{}, false
+	}
+
+	if !contains(presentation.Type, "VerifiablePresentation") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not_a_verifiable_presentation"})
+		return Credential{}, false
+	}
+	if presentation.Holder != subject {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "presentation_holder_mismatch"})
+		return Credential{}, false
+	}
+	if len(presentation.VerifiableCredential) != 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "presentation_must_contain_one_credential"})
+		return Credential{}, false
+	}
+	if presentation.Proof == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "presentation_proof_missing"})
+		return Credential{}, false
+	}
+	if presentation.Proof.Challenge != challenge {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "presentation_challenge_mismatch"})
+		return Credential{}, false
+	}
+	if presentation.Proof.Domain != record.Domain {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "presentation_domain_mismatch"})
+		return Credential{}, false
+	}
+	if !verifyPresentationSignature(presentation) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_presentation_signature"})
+		return Credential{}, false
+	}
+
+	owner := presentation.VerifiableCredential[0]
+	if !hasType(owner, "OwnerCredential") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_required"})
+		return Credential{}, false
+	}
+	if owner.CredentialSubject.ID != subject {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_subject_mismatch"})
+		return Credential{}, false
+	}
+	if owner.CredentialStatus.Status != "active" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_not_active"})
+		return Credential{}, false
+	}
+	if !verifySignature(owner) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_bad_signature"})
+		return Credential{}, false
+	}
+
+	return owner, true
+}
+
+func verifyPresentationSignature(presentation VerifiablePresentation) bool {
+	proof := presentation.Proof
+	if proof == nil {
+		return false
+	}
+	if proof.Type != "DataIntegrityProof" ||
+		proof.Cryptosuite != "eddsa-rdfc-2022" ||
+		proof.ProofPurpose != "authentication" {
+		return false
+	}
+	if !strings.HasPrefix(proof.VerificationMethod, presentation.Holder+"#") {
+		return false
+	}
+
+	publicKey, err := didKeyVerificationKey(presentation.Holder, proof.VerificationMethod)
+	if err != nil {
+		return false
+	}
+	signature, err := hex.DecodeString(proof.ProofValue)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(publicKey, presentationSigningInput(presentation), signature)
+}
+
+func presentationSigningInput(vp VerifiablePresentation) []byte {
+	vp.Proof = nil
+	raw, err := json.Marshal(vp)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func didKeyVerificationKey(did, verificationMethod string) (ed25519.PublicKey, error) {
+	if verificationMethod != did+"#key-1" {
+		return nil, fmt.Errorf("verification_method_not_found")
+	}
+
+	encoded, ok := strings.CutPrefix(did, "did:key:z")
+	if !ok {
+		return nil, fmt.Errorf("unsupported_did_method")
+	}
+	decoded, err := base58Decode(encoded)
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) != 34 || decoded[0] != 0xed || decoded[1] != 0x01 {
+		return nil, fmt.Errorf("unsupported_did_key_multicodec")
+	}
+	return ed25519.PublicKey(decoded[2:34]), nil
 }
 
 func newCredential(kind, subject, gateway string, deviceScopes, actionScopes []string, validFrom, validUntil time.Time) Credential {
@@ -620,6 +804,85 @@ func saveRevocations(path string, revocations Revocations) error {
 	}
 
 	return os.WriteFile(path, raw, 0o644)
+}
+
+func (s *credentialChallengeStore) Put(challenge string, record credentialChallengeRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.challenges[challenge] = record
+}
+
+func (s *credentialChallengeStore) Consume(challenge string) (credentialChallengeRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record, ok := s.challenges[challenge]
+	if ok {
+		delete(s.challenges, challenge)
+	}
+	return record, ok
+}
+
+func newChallenge() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+func validCredentialOperation(operation string) bool {
+	switch operation {
+	case "delegation", "revocation", "transfer":
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, out any) bool {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
+		return false
+	}
+	return true
+}
+
+func base58Decode(input string) ([]byte, error) {
+	input = strings.TrimPrefix(input, "z")
+	alphabet := "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+	bytes := []byte{0}
+
+	for _, ch := range []byte(input) {
+		index := strings.IndexByte(alphabet, ch)
+		if index < 0 {
+			return nil, fmt.Errorf("bad_base58_character")
+		}
+
+		carry := index
+		for i := len(bytes) - 1; i >= 0; i-- {
+			carry += int(bytes[i]) * 58
+			bytes[i] = byte(carry & 0xff)
+			carry >>= 8
+		}
+
+		for carry > 0 {
+			bytes = append([]byte{byte(carry & 0xff)}, bytes...)
+			carry >>= 8
+		}
+	}
+
+	for _, ch := range []byte(input) {
+		if ch != '1' {
+			break
+		}
+		bytes = append([]byte{0}, bytes...)
+	}
+
+	return bytes, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

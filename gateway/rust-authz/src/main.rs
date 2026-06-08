@@ -98,12 +98,11 @@ struct CredentialStatus {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuthzRequest {
     subject: String,
     device_id: String,
     action: String,
-    #[serde(default)]
-    credential: Credential,
     #[serde(default)]
     challenge: Option<String>,
     #[serde(default)]
@@ -254,21 +253,13 @@ async fn authorize(
 
 fn evaluate(state: &AppState, req: &AuthzRequest) -> Result<String, String> {
     let resolved = resolve_request_credential(state, req)?;
-    let req = AuthzRequest {
-        subject: req.subject.clone(),
-        device_id: req.device_id.clone(),
-        action: req.action.clone(),
-        credential: resolved,
-        challenge: req.challenge.clone(),
-        presentation: req.presentation.clone(),
-    };
 
-    validate_common(state, &req)?;
+    validate_common(state, req, &resolved)?;
 
-    if has_type(&req.credential, "OwnerCredential") {
-        authorize_owner(&req)
-    } else if has_type(&req.credential, "DelegationCredential") {
-        authorize_delegation(&req)
+    if has_type(&resolved, "OwnerCredential") {
+        authorize_owner(&resolved)
+    } else if has_type(&resolved, "DelegationCredential") {
+        authorize_delegation(&resolved)
     } else {
         Err("unsupported_credential_type".to_string())
     }
@@ -279,11 +270,7 @@ fn resolve_request_credential(state: &AppState, req: &AuthzRequest) -> Result<Cr
         return verify_presentation(state, req, presentation);
     }
 
-    if req.credential.id.is_empty() {
-        return Err("credential_or_presentation_required".to_string());
-    }
-
-    Ok(req.credential.clone())
+    Err("presentation_required".to_string())
 }
 
 fn verify_presentation(
@@ -352,9 +339,7 @@ fn verify_presentation(
     Ok(credential)
 }
 
-fn validate_common(state: &AppState, req: &AuthzRequest) -> Result<(), String> {
-    let cred = &req.credential;
-
+fn validate_common(state: &AppState, req: &AuthzRequest, cred: &Credential) -> Result<(), String> {
     if cred.issuer != state.trusted_issuer {
         return Err("issuer_not_trusted".to_string());
     }
@@ -405,9 +390,7 @@ fn validate_common(state: &AppState, req: &AuthzRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn authorize_owner(req: &AuthzRequest) -> Result<String, String> {
-    let cred = &req.credential;
-
+fn authorize_owner(cred: &Credential) -> Result<String, String> {
     let has_transfer_lineage = cred
         .credential_subject
         .transferred_by
@@ -428,9 +411,7 @@ fn authorize_owner(req: &AuthzRequest) -> Result<String, String> {
     }
 }
 
-fn authorize_delegation(req: &AuthzRequest) -> Result<String, String> {
-    let cred = &req.credential;
-
+fn authorize_delegation(cred: &Credential) -> Result<String, String> {
     let delegated_by = cred
         .credential_subject
         .delegated_by
