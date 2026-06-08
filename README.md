@@ -31,13 +31,13 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 - **Ownership transfer** flows
 - Additional device simulators and adapters (**light**, **sensor**)
 - Data-flow mediation/redirection for compatible devices
+- Audit logging and authorization traceability
+- Scenario runners for all evaluation scenarios
 
 ### To be implemented
 
 - More complete SSI alignment for the credential model
 - Local policy management and richer household rules
-- Audit logging and authorization traceability
-- Scenario runners for all evaluation scenarios
 - Integration tests, scenario tests, and performance measurements
 - ADRs, API documentation, scripts, and CI workflows
 
