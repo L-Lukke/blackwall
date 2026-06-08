@@ -12,8 +12,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
+
+const challengeTTL = 5 * time.Minute
+
+var challengeStore = newChallengeStore()
 
 type Proof struct {
 	Type               string `json:"type"`
@@ -95,6 +100,25 @@ type ChallengeResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+type ChallengeRecord struct {
+	Subject   string
+	DeviceID  string
+	Action    string
+	Domain    string
+	ExpiresAt time.Time
+}
+
+type ChallengeStore struct {
+	mu         sync.Mutex
+	challenges map[string]ChallengeRecord
+}
+
+func newChallengeStore() *ChallengeStore {
+	return &ChallengeStore{
+		challenges: map[string]ChallengeRecord{},
+	}
+}
+
 type AuthzResponse struct {
 	Allow  bool   `json:"allow"`
 	Reason string `json:"reason"`
@@ -162,11 +186,20 @@ func challengeHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "challenge_generation_failed"})
 		return
 	}
+	domain := getenv("GATEWAY_ID", "gateway-home-1")
+	expiresAt := time.Now().UTC().Add(challengeTTL)
+	challengeStore.Put(challenge, ChallengeRecord{
+		Subject:   req.Subject,
+		DeviceID:  req.DeviceID,
+		Action:    req.Action,
+		Domain:    domain,
+		ExpiresAt: expiresAt,
+	})
 
 	writeJSON(w, http.StatusOK, ChallengeResponse{
 		Challenge: challenge,
-		Domain:    getenv("GATEWAY_ID", "gateway-home-1"),
-		ExpiresAt: time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339),
+		Domain:    domain,
+		ExpiresAt: expiresAt.Format(time.RFC3339),
 	})
 }
 
@@ -182,6 +215,16 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 		appendAuditLog(AccessRequest{}, nil, "bad_json", http.StatusBadRequest, err.Error(), "")
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
 		return
+	}
+	if req.Presentation != nil {
+		if reason := challengeStore.Consume(req); reason != "" {
+			appendAuditLog(req, nil, "challenge_rejected", http.StatusForbidden, reason, "")
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"allowed": false,
+				"reason":  reason,
+			})
+			return
+		}
 	}
 
 	var authzResp AuthzResponse
@@ -416,6 +459,64 @@ func randomHex(size int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func (s *ChallengeStore) Put(challenge string, record ChallengeRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.deleteExpiredLocked(time.Now().UTC())
+	s.challenges[challenge] = record
+}
+
+func (s *ChallengeStore) Consume(req AccessRequest) string {
+	if req.Challenge == "" {
+		return "presentation_challenge_required"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	s.deleteExpiredLocked(now)
+
+	record, ok := s.challenges[req.Challenge]
+	if !ok {
+		return "challenge_replayed_or_unknown"
+	}
+	delete(s.challenges, req.Challenge)
+
+	if now.After(record.ExpiresAt) {
+		return "challenge_expired"
+	}
+	if record.Subject != req.Subject {
+		return "challenge_subject_mismatch"
+	}
+	if record.DeviceID != req.DeviceID {
+		return "challenge_device_mismatch"
+	}
+	if record.Action != req.Action {
+		return "challenge_action_mismatch"
+	}
+	if req.Presentation == nil || req.Presentation.Proof == nil {
+		return "presentation_proof_missing"
+	}
+	if req.Presentation.Proof.Challenge != req.Challenge {
+		return "presentation_challenge_mismatch"
+	}
+	if req.Presentation.Proof.Domain != record.Domain {
+		return "presentation_domain_mismatch"
+	}
+
+	return ""
+}
+
+func (s *ChallengeStore) deleteExpiredLocked(now time.Time) {
+	for challenge, record := range s.challenges {
+		if now.After(record.ExpiresAt) {
+			delete(s.challenges, challenge)
+		}
+	}
 }
 
 func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string, status int, errText string, persistedTo string) {

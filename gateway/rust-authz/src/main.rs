@@ -1,10 +1,13 @@
+mod did;
+
 use axum::{
     Json, Router,
     extract::State,
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use did::DidKeyResolver;
+use ed25519_dalek::{Signature, Verifier};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, fs, sync::Arc};
 
@@ -327,7 +330,9 @@ fn verify_presentation(
         return Err("presentation_verification_method_mismatch".to_string());
     }
 
-    let key = resolve_did_key(&presentation.holder)?;
+    let resolver = DidKeyResolver;
+    let key =
+        resolver.resolve_verification_key(&presentation.holder, &proof.verification_method)?;
     let signature = decode_signature(&proof.proof_value)?;
     if key
         .verify(
@@ -504,7 +509,17 @@ fn verify_credential_signature(cred: &Credential) -> bool {
         return false;
     }
 
-    let Ok(verifying_key) = resolve_did_key(&cred.issuer) else {
+    if !proof
+        .verification_method
+        .starts_with(&(cred.issuer.clone() + "#"))
+    {
+        return false;
+    }
+
+    let resolver = DidKeyResolver;
+    let Ok(verifying_key) =
+        resolver.resolve_verification_key(&cred.issuer, &proof.verification_method)
+    else {
         return false;
     };
 
@@ -534,53 +549,6 @@ fn presentation_signing_input(presentation: &VerifiablePresentation) -> String {
     let mut unsigned = presentation.clone();
     unsigned.proof = None;
     serde_json::to_string(&unsigned).unwrap_or_default()
-}
-
-fn resolve_did_key(did: &str) -> Result<VerifyingKey, String> {
-    let Some(encoded) = did.strip_prefix("did:key:z") else {
-        return Err("unsupported_did_method".to_string());
-    };
-
-    let decoded = base58_decode(encoded)?;
-    if decoded.len() != 34 || decoded[0] != 0xed || decoded[1] != 0x01 {
-        return Err("unsupported_did_key_multicodec".to_string());
-    }
-
-    let public_key_array =
-        <[u8; 32]>::try_from(&decoded[2..34]).map_err(|_| "bad_did_key_length".to_string())?;
-    VerifyingKey::from_bytes(&public_key_array).map_err(|_| "bad_did_key".to_string())
-}
-
-fn base58_decode(input: &str) -> Result<Vec<u8>, String> {
-    let alphabet = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let mut bytes: Vec<u8> = vec![0];
-
-    for ch in input.bytes() {
-        let Some(mut carry) = alphabet.iter().position(|&c| c == ch).map(|p| p as u32) else {
-            return Err("bad_base58_character".to_string());
-        };
-
-        for byte in bytes.iter_mut().rev() {
-            carry += (*byte as u32) * 58;
-            *byte = (carry & 0xff) as u8;
-            carry >>= 8;
-        }
-
-        while carry > 0 {
-            bytes.insert(0, (carry & 0xff) as u8);
-            carry >>= 8;
-        }
-    }
-
-    for ch in input.bytes() {
-        if ch == b'1' {
-            bytes.insert(0, 0);
-        } else {
-            break;
-        }
-    }
-
-    Ok(bytes)
 }
 
 fn has_type(cred: &Credential, kind: &str) -> bool {

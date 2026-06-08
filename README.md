@@ -35,8 +35,9 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 - Audit logging and authorization traceability
 - Scenario runners for all evaluation scenarios
 - VC-shaped SSI credentials with DID issuers, holder subjects, credential status, and Ed25519 Data Integrity proofs
-- `did:key` resolution for issuer and holder verification keys
+- `did:key` resolution behind a DID document/resolver boundary for issuer and holder verification keys
 - Holder wallet and challenge-bound verifiable presentation flow
+- Stateful VP challenges with expiry, subject/device/action binding, and one-time consumption
 
 ### To be implemented
 
@@ -162,6 +163,7 @@ These logs are runtime output and are intentionally ignored by git.
 * the gateway issues a challenge and domain
 * the wallet signs a verifiable presentation containing the credential
 * the authorization service resolves issuer and holder `did:key` values and verifies both proofs
+* replaying the same presentation challenge is denied
 * expected reason: `allowed_by_owner_credential`
 
 ### SSI flow
@@ -178,7 +180,7 @@ Authorization service: resolve issuer/holder did:key values, verify VC + VP proo
 Gateway -> Device simulator: execute command only after allow
 ```
 
-This is still a PoC. The current challenge is bound into the VP proof and checked by the authorization service, but challenge persistence, expiry enforcement, and one-time-use replay protection are the next security-hardening step.
+The gateway stores VP challenges in memory with subject, device, action, domain, and expiry metadata. A challenge is consumed on first use, so replaying the same VP challenge is denied. This is still PoC-grade state: challenges are not durable across gateway restarts and are not shared across multiple gateway instances.
 
 ### Version-control hygiene
 

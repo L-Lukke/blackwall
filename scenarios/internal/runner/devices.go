@@ -212,6 +212,22 @@ func (c *Client) RunVPChallengeFlowOn(target DeviceTarget) ScenarioResult {
 		result.Steps = append(result.Steps, "data persisted to "+allowResp.PersistedTo)
 	}
 
+	replayResp, err := c.accessDeviceWithPresentation(
+		holderDID,
+		target.DeviceID,
+		target.PrimaryAction,
+		challenge.Challenge,
+		presentation,
+		http.StatusForbidden,
+	)
+	if err != nil {
+		return fail(result, start, "vp replay request failed", err)
+	}
+	if replayResp.Allowed || replayResp.Reason != "challenge_replayed_or_unknown" {
+		return fail(result, start, "unexpected vp replay outcome", fmt.Errorf("allowed=%v reason=%s", replayResp.Allowed, replayResp.Reason))
+	}
+	result.Steps = append(result.Steps, "vp replay denied with reason="+replayResp.Reason)
+
 	result.Passed = true
 	result.Duration = time.Since(start)
 	return result
