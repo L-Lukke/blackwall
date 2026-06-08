@@ -105,7 +105,7 @@ func DefaultSpecs() []ServiceSpec {
 		},
 		{
 			Name:    "light-sim",
-			WorkDir:  "devices/light-sim",
+			WorkDir: "devices/light-sim",
 			Command: []string{"go", "run", "."},
 			Env:     nil,
 		},

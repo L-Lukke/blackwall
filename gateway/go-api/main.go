@@ -52,6 +52,28 @@ type DeviceCommand struct {
 	DeviceID string `json:"device_id"`
 }
 
+type AuditRecord struct {
+	EventID              string `json:"event_id"`
+	RecordedAt           string `json:"recorded_at"`
+	Subject              string `json:"subject,omitempty"`
+	DeviceID             string `json:"device_id,omitempty"`
+	Action               string `json:"action,omitempty"`
+	CredentialID         string `json:"credential_id,omitempty"`
+	CredentialType       string `json:"credential_type,omitempty"`
+	CredentialIssuer     string `json:"credential_issuer,omitempty"`
+	CredentialSubject    string `json:"credential_subject,omitempty"`
+	DelegatedBy          string `json:"delegated_by,omitempty"`
+	ParentCredentialID   string `json:"parent_credential_id,omitempty"`
+	TransferredBy        string `json:"transferred_by,omitempty"`
+	ReplacesCredentialID string `json:"replaces_credential_id,omitempty"`
+	AuthzAllow           *bool  `json:"authz_allow,omitempty"`
+	AuthzReason          string `json:"authz_reason,omitempty"`
+	Outcome              string `json:"outcome"`
+	HTTPStatus           int    `json:"http_status"`
+	PersistedTo          string `json:"persisted_to,omitempty"`
+	Error                string `json:"error,omitempty"`
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
@@ -68,12 +90,14 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 
 func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		appendAuditLog(AccessRequest{}, nil, "method_not_allowed", http.StatusMethodNotAllowed, "method_not_allowed", "")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
 		return
 	}
 
 	var req AccessRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		appendAuditLog(AccessRequest{}, nil, "bad_json", http.StatusBadRequest, err.Error(), "")
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_json"})
 		return
 	}
@@ -84,6 +108,7 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 		req,
 		&authzResp,
 	); err != nil {
+		appendAuditLog(req, nil, "authz_unreachable", http.StatusBadGateway, err.Error(), "")
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":   "authz_unreachable",
 			"details": err.Error(),
@@ -92,6 +117,7 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !authzResp.Allow {
+		appendAuditLog(req, &authzResp, "denied_by_authz", http.StatusForbidden, "", "")
 		writeJSON(w, http.StatusForbidden, map[string]any{
 			"allowed": false,
 			"reason":  authzResp.Reason,
@@ -107,6 +133,7 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 	case "turn_on", "turn_off":
 		handleLightAction(w, req, authzResp)
 	default:
+		appendAuditLog(req, &authzResp, "unsupported_action", http.StatusBadRequest, "unsupported_action_for_v1", "")
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "unsupported_action_for_v1",
 		})
@@ -118,12 +145,37 @@ func handleLockAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 
 	var deviceResp map[string]any
 	if err := postJSON(deviceURL, DeviceCommand{DeviceID: req.DeviceID}, &deviceResp); err != nil {
+		appendAuditLog(req, &authzResp, "device_unreachable", http.StatusBadGateway, err.Error(), "")
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":   "device_unreachable",
 			"details": err.Error(),
 		})
 		return
 	}
+
+	appendAuditLog(req, &authzResp, "device_command_sent", http.StatusOK, "", "")
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"allowed":       true,
+		"reason":        authzResp.Reason,
+		"device_result": deviceResp,
+	})
+}
+
+func handleLightAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
+	deviceURL := getenv("LIGHT_URL", "http://localhost:8092") + "/" + req.Action
+
+	var deviceResp map[string]any
+	if err := postJSON(deviceURL, DeviceCommand{DeviceID: req.DeviceID}, &deviceResp); err != nil {
+		appendAuditLog(req, &authzResp, "light_unreachable", http.StatusBadGateway, err.Error(), "")
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":   "light_unreachable",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	appendAuditLog(req, &authzResp, "device_command_sent", http.StatusOK, "", "")
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"allowed":       true,
@@ -133,11 +185,11 @@ func handleLockAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 }
 
 func handleReadSensor(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
-	sensorURL := getenv("SENSOR_URL", "http://localhost:8091") +
-		"/reading?device_id=" + url.QueryEscape(req.DeviceID)
+	sensorURL := getenv("SENSOR_URL", "http://localhost:8091") + "/reading?device_id=" + url.QueryEscape(req.DeviceID)
 
 	var reading map[string]any
 	if err := getJSON(sensorURL, &reading); err != nil {
+		appendAuditLog(req, &authzResp, "sensor_unreachable", http.StatusBadGateway, err.Error(), "")
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":   "sensor_unreachable",
 			"details": err.Error(),
@@ -156,6 +208,7 @@ func handleReadSensor(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 
 	sinkPath := getenv("LOCAL_SINK_FILE", "../../testdata/data/local-sink.ndjson")
 	if err := appendNDJSON(sinkPath, record); err != nil {
+		appendAuditLog(req, &authzResp, "local_sink_write_failed", http.StatusInternalServerError, err.Error(), sinkPath)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error":   "local_sink_write_failed",
 			"details": err.Error(),
@@ -163,30 +216,13 @@ func handleReadSensor(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 		return
 	}
 
+	appendAuditLog(req, &authzResp, "data_persisted", http.StatusOK, "", sinkPath)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"allowed":       true,
 		"reason":        authzResp.Reason,
 		"device_result": reading,
 		"persisted_to":  sinkPath,
-	})
-}
-
-func handleLightAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
-	deviceURL := getenv("LIGHT_URL", "http://localhost:8092") + "/" + req.Action
-
-	var deviceResp map[string]any
-	if err := postJSON(deviceURL, DeviceCommand{DeviceID: req.DeviceID}, &deviceResp); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error":   "light_unreachable",
-			"details": err.Error(),
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"allowed":       true,
-		"reason":        authzResp.Reason,
-		"device_result": deviceResp,
 	})
 }
 
@@ -290,6 +326,41 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string, status int, errText string, persistedTo string) {
+	now := time.Now().UTC()
+
+	record := AuditRecord{
+		EventID:              fmt.Sprintf("audit-%d", now.UnixNano()),
+		RecordedAt:           now.Format(time.RFC3339),
+		Subject:              req.Subject,
+		DeviceID:             req.DeviceID,
+		Action:               req.Action,
+		CredentialID:         req.Credential.ID,
+		CredentialType:       req.Credential.Type,
+		CredentialIssuer:     req.Credential.Issuer,
+		CredentialSubject:    req.Credential.Subject,
+		DelegatedBy:          req.Credential.DelegatedBy,
+		ParentCredentialID:   req.Credential.ParentCredentialID,
+		TransferredBy:        req.Credential.TransferredBy,
+		ReplacesCredentialID: req.Credential.ReplacesCredentialID,
+		Outcome:              outcome,
+		HTTPStatus:           status,
+		Error:                errText,
+		PersistedTo:          persistedTo,
+	}
+
+	if authzResp != nil {
+		allow := authzResp.Allow
+		record.AuthzAllow = &allow
+		record.AuthzReason = authzResp.Reason
+	}
+
+	path := getenv("AUDIT_LOG_FILE", "../../testdata/audit/audit.ndjson")
+	if err := appendNDJSON(path, record); err != nil {
+		log.Printf("audit log write failed: %v", err)
+	}
 }
 
 func getenv(key, fallback string) string {
