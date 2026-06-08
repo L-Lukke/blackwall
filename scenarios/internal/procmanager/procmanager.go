@@ -104,6 +104,12 @@ func DefaultSpecs() []ServiceSpec {
 			Env:     nil,
 		},
 		{
+			Name:    "light-sim",
+			WorkDir:  "devices/light-sim",
+			Command: []string{"go", "run", "."},
+			Env:     nil,
+		},
+		{
 			Name:    "gateway",
 			WorkDir: "gateway/go-api",
 			Command: []string{"go", "run", "."},
@@ -111,6 +117,7 @@ func DefaultSpecs() []ServiceSpec {
 				"AUTHZ_URL=http://127.0.0.1:8081/v1/authorize",
 				"LOCK_URL=http://127.0.0.1:8090",
 				"SENSOR_URL=http://127.0.0.1:8091",
+				"LIGHT_URL=http://127.0.0.1:8092",
 				"LOCAL_SINK_FILE=../../testdata/data/local-sink.ndjson",
 			},
 		},

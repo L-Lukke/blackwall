@@ -14,9 +14,14 @@ import (
 type Config struct {
 	IssuerURL      string
 	GatewayURL     string
+	AuthzHealthURL string
+	LockURL        string
+	SensorURL      string
+	LightURL       string
 	GatewayID      string
 	DeviceID       string
 	SensorDeviceID string
+	LightDeviceID  string
 	Timeout        time.Duration
 }
 
@@ -31,21 +36,21 @@ type Proof struct {
 }
 
 type Credential struct {
-	ID                 string   `json:"id"`
-	Type               string   `json:"type"`
-	Issuer             string   `json:"issuer"`
-	Subject            string   `json:"subject"`
-	Gateway            string   `json:"gateway"`
-	DeviceScopes       []string `json:"device_scopes"`
-	ActionScopes       []string `json:"action_scopes"`
-	DelegatedBy        string   `json:"delegated_by,omitempty"`
-	ParentCredentialID string   `json:"parent_credential_id,omitempty"`
-	TransferredBy      string   `json:"transferred_by,omitempty"`
-	ReplacesCredentialID string `json:"replaces_credential_id,omitempty"`
-	IssuedAt           string   `json:"issued_at"`
-	ExpiresAt          string   `json:"expires_at"`
-	Status             string   `json:"status"`
-	Proof              Proof    `json:"proof"`
+	ID                   string   `json:"id"`
+	Type                 string   `json:"type"`
+	Issuer               string   `json:"issuer"`
+	Subject              string   `json:"subject"`
+	Gateway              string   `json:"gateway"`
+	DeviceScopes         []string `json:"device_scopes"`
+	ActionScopes         []string `json:"action_scopes"`
+	DelegatedBy          string   `json:"delegated_by,omitempty"`
+	ParentCredentialID   string   `json:"parent_credential_id,omitempty"`
+	TransferredBy        string   `json:"transferred_by,omitempty"`
+	ReplacesCredentialID string   `json:"replaces_credential_id,omitempty"`
+	IssuedAt             string   `json:"issued_at"`
+	ExpiresAt            string   `json:"expires_at"`
+	Status               string   `json:"status"`
+	Proof                Proof    `json:"proof"`
 }
 
 type OwnerCredentialRequest struct {
@@ -56,12 +61,12 @@ type OwnerCredentialRequest struct {
 }
 
 type DelegationCredentialRequest struct {
-	DelegatedBy   string     `json:"delegated_by"`
-	Subject       string     `json:"subject"`
-	Gateway       string     `json:"gateway"`
-	DeviceScopes  []string   `json:"device_scopes"`
-	ActionScopes  []string   `json:"action_scopes"`
-	TTLMinutes    int        `json:"ttl_minutes"`
+	DelegatedBy     string     `json:"delegated_by"`
+	Subject         string     `json:"subject"`
+	Gateway         string     `json:"gateway"`
+	DeviceScopes    []string   `json:"device_scopes"`
+	ActionScopes    []string   `json:"action_scopes"`
+	TTLMinutes      int        `json:"ttl_minutes"`
 	OwnerCredential Credential `json:"owner_credential"`
 }
 
@@ -81,9 +86,9 @@ type TransferOwnershipRequest struct {
 }
 
 type TransferOwnershipResponse struct {
-	OK                bool       `json:"ok"`
-	RevokedCredentialID string   `json:"revoked_credential_id"`
-	NewOwnerCredential Credential `json:"new_owner_credential"`
+	OK                  bool       `json:"ok"`
+	RevokedCredentialID string     `json:"revoked_credential_id"`
+	NewOwnerCredential  Credential `json:"new_owner_credential"`
 }
 
 type AccessRequest struct {
@@ -124,9 +129,14 @@ func LoadConfig() Config {
 	return Config{
 		IssuerURL:      getenv("ISSUER_URL", "http://127.0.0.1:8082"),
 		GatewayURL:     getenv("GATEWAY_URL", "http://127.0.0.1:8080"),
+		AuthzHealthURL: getenv("AUTHZ_HEALTH_URL", "http://127.0.0.1:8081"),
+		LockURL:        getenv("LOCK_URL", "http://127.0.0.1:8090"),
+		SensorURL:      getenv("SENSOR_URL", "http://127.0.0.1:8091"),
+		LightURL:       getenv("LIGHT_URL", "http://127.0.0.1:8092"),
 		GatewayID:      getenv("GATEWAY_ID", "gateway-home-1"),
 		DeviceID:       getenv("DEVICE_ID", "lock-front-door"),
 		SensorDeviceID: getenv("SENSOR_DEVICE_ID", "sensor-living-room"),
+		LightDeviceID:  getenv("LIGHT_DEVICE_ID", "light-living-room"),
 		Timeout:        10 * time.Second,
 	}
 }
@@ -144,6 +154,10 @@ func (c *Client) CheckHealth() []ServiceHealth {
 	return []ServiceHealth{
 		c.checkOne("issuer", c.cfg.IssuerURL+"/health"),
 		c.checkOne("gateway", c.cfg.GatewayURL+"/health"),
+		c.checkOne("authz", c.cfg.AuthzHealthURL+"/health"),
+		c.checkOne("lock-sim", c.cfg.LockURL+"/health"),
+		c.checkOne("sensor-sim", c.cfg.SensorURL+"/health"),
+		c.checkOne("light-sim", c.cfg.LightURL+"/health"),
 	}
 }
 
@@ -392,12 +406,12 @@ func (c *Client) issueDelegationCredentialForDevice(delegatedBy, subject string,
 	err := c.postJSON(
 		c.cfg.IssuerURL+"/credentials/delegation",
 		DelegationCredentialRequest{
-			DelegatedBy:    delegatedBy,
-			Subject:        subject,
-			Gateway:        c.cfg.GatewayID,
-			DeviceScopes:   []string{deviceID},
-			ActionScopes:   actions,
-			TTLMinutes:     ttlMinutes,
+			DelegatedBy:     delegatedBy,
+			Subject:         subject,
+			Gateway:         c.cfg.GatewayID,
+			DeviceScopes:    []string{deviceID},
+			ActionScopes:    actions,
+			TTLMinutes:      ttlMinutes,
 			OwnerCredential: owner,
 		},
 		&cred,

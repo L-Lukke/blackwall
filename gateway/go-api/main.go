@@ -104,6 +104,8 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 		handleLockAction(w, req, authzResp)
 	case "read_sensor":
 		handleReadSensor(w, req, authzResp)
+	case "turn_on", "turn_off":
+		handleLightAction(w, req, authzResp)
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "unsupported_action_for_v1",
@@ -166,6 +168,25 @@ func handleReadSensor(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 		"reason":        authzResp.Reason,
 		"device_result": reading,
 		"persisted_to":  sinkPath,
+	})
+}
+
+func handleLightAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
+	deviceURL := getenv("LIGHT_URL", "http://localhost:8092") + "/" + req.Action
+
+	var deviceResp map[string]any
+	if err := postJSON(deviceURL, DeviceCommand{DeviceID: req.DeviceID}, &deviceResp); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":   "light_unreachable",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"allowed":       true,
+		"reason":        authzResp.Reason,
+		"device_result": deviceResp,
 	})
 }
 

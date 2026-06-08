@@ -1,7 +1,13 @@
 {
-  "devices": {
-    "lock-front-door": {
-      "allowed_actions": ["lock", "unlock"]
-    }
-  }
+	"devices": {
+		"lock-front-door": {
+			"allowed_actions": ["lock", "unlock"]
+		},
+		"sensor-living-room": {
+			"allowed_actions": ["read_sensor"]
+		},
+		"light-living-room": {
+			"allowed_actions": ["turn_on", "turn_off"]
+		}
+	}
 }
