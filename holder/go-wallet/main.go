@@ -2,15 +2,18 @@ package main
 
 import (
 	"crypto/ed25519"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Proof struct {
@@ -83,10 +86,9 @@ type PresentationRequest struct {
 }
 
 type Wallet struct {
-	mu          sync.Mutex
-	privateKey  ed25519.PrivateKey
-	did         string
-	credentials map[string]Credential
+	privateKey ed25519.PrivateKey
+	did        string
+	db         *sql.DB
 }
 
 func main() {
@@ -106,11 +108,20 @@ func main() {
 
 func newWallet() *Wallet {
 	privateKey := walletPrivateKey()
-	return &Wallet{
-		privateKey:  privateKey,
-		did:         didKeyFromPublicKey(privateKey.Public().(ed25519.PublicKey)),
-		credentials: map[string]Credential{},
+	did := didKeyFromPublicKey(privateKey.Public().(ed25519.PublicKey))
+	db, err := openWalletDB(walletDBPath())
+	if err != nil {
+		log.Fatalf("open wallet db: %v", err)
 	}
+	wallet := &Wallet{
+		privateKey: privateKey,
+		did:        did,
+		db:         db,
+	}
+	if err := wallet.saveMetadata(); err != nil {
+		log.Fatalf("save wallet metadata: %v", err)
+	}
+	return wallet
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
@@ -148,9 +159,10 @@ func (wlt *Wallet) credentialsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wlt.mu.Lock()
-	wlt.credentials[req.Credential.ID] = req.Credential
-	wlt.mu.Unlock()
+	if err := wlt.storeCredential(req.Credential); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "credential_store_failed"})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credential_id": req.Credential.ID})
 }
@@ -204,17 +216,75 @@ func (wlt *Wallet) presentationsHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func (wlt *Wallet) findCredential(id string) (Credential, bool) {
-	wlt.mu.Lock()
-	defer wlt.mu.Unlock()
-
+	var raw string
+	var err error
 	if id != "" {
-		cred, ok := wlt.credentials[id]
-		return cred, ok
+		err = wlt.db.QueryRow(`SELECT raw_json FROM credentials WHERE id = ?`, id).Scan(&raw)
+	} else {
+		err = wlt.db.QueryRow(`SELECT raw_json FROM credentials ORDER BY stored_at DESC LIMIT 1`).Scan(&raw)
 	}
-	for _, cred := range wlt.credentials {
-		return cred, true
+	if err != nil {
+		return Credential{}, false
 	}
-	return Credential{}, false
+	var cred Credential
+	if err := json.Unmarshal([]byte(raw), &cred); err != nil {
+		return Credential{}, false
+	}
+	return cred, true
+}
+
+func (wlt *Wallet) storeCredential(cred Credential) error {
+	raw, err := json.Marshal(cred)
+	if err != nil {
+		return err
+	}
+	_, err = wlt.db.Exec(`
+		INSERT INTO credentials (
+			id, holder, issuer, raw_json, stored_at
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			holder = excluded.holder,
+			issuer = excluded.issuer,
+			raw_json = excluded.raw_json,
+			stored_at = excluded.stored_at
+	`, cred.ID, wlt.did, cred.Issuer, string(raw), time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (wlt *Wallet) saveMetadata() error {
+	tx, err := wlt.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	metadata := map[string]string{
+		"holder_did":          wlt.did,
+		"verification_method": wlt.did + "#key-1",
+	}
+	for key, value := range metadata {
+		if _, err := tx.Exec(`
+			INSERT INTO wallet_metadata (key, value, updated_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+		`, key, value, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	keyMetadata := map[string]string{
+		"key_type":            "Ed25519",
+		"key_source":          walletKeySource(),
+		"verification_method": wlt.did + "#key-1",
+	}
+	for key, value := range keyMetadata {
+		if _, err := tx.Exec(`
+			INSERT INTO key_metadata (key, value, updated_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+		`, key, value, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func presentationSigningInput(vp VerifiablePresentation) []byte {
@@ -246,6 +316,55 @@ func walletPrivateKey() ed25519.PrivateKey {
 	log.Fatal("WALLET_ED25519_PRIVATE_KEY_HEX or WALLET_ED25519_SEED_HEX must be set to a valid Ed25519 key")
 	return nil
 }
+
+func walletKeySource() string {
+	if os.Getenv("WALLET_ED25519_PRIVATE_KEY_HEX") != "" {
+		return "WALLET_ED25519_PRIVATE_KEY_HEX"
+	}
+	return "WALLET_ED25519_SEED_HEX"
+}
+
+func openWalletDB(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(walletSchema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+const walletSchema = `
+CREATE TABLE IF NOT EXISTS credentials (
+	id TEXT PRIMARY KEY,
+	holder TEXT NOT NULL,
+	issuer TEXT NOT NULL,
+	raw_json TEXT NOT NULL,
+	stored_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wallet_metadata (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS key_metadata (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+`
 
 func didKeyFromPublicKey(publicKey ed25519.PublicKey) string {
 	prefixed := append([]byte{0xed, 0x01}, publicKey...)
@@ -315,4 +434,8 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func walletDBPath() string {
+	return getenv("WALLET_DB_PATH", "../../runtime/wallet/wallet.db")
 }

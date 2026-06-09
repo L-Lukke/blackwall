@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,13 +13,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const challengeTTL = 5 * time.Minute
 
-var challengeStore = newChallengeStore()
+var gatewayDB *sql.DB
 
 type Proof struct {
 	Type               string `json:"type"`
@@ -107,17 +109,6 @@ type ChallengeRecord struct {
 	ExpiresAt time.Time
 }
 
-type ChallengeStore struct {
-	mu         sync.Mutex
-	challenges map[string]ChallengeRecord
-}
-
-func newChallengeStore() *ChallengeStore {
-	return &ChallengeStore{
-		challenges: map[string]ChallengeRecord{},
-	}
-}
-
 type AuthzResponse struct {
 	Allow  bool   `json:"allow"`
 	Reason string `json:"reason"`
@@ -151,6 +142,13 @@ type AuditRecord struct {
 
 func main() {
 	requireEnv("SERVICE_AUTH_TOKEN")
+
+	var err error
+	gatewayDB, err = openGatewayDB(gatewayDBPath())
+	if err != nil {
+		log.Fatalf("open gateway db: %v", err)
+	}
+	defer gatewayDB.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
@@ -189,13 +187,16 @@ func challengeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	domain := getenv("GATEWAY_ID", "gateway-home-1")
 	expiresAt := time.Now().UTC().Add(challengeTTL)
-	challengeStore.Put(challenge, ChallengeRecord{
+	if err := saveAccessChallenge(challenge, ChallengeRecord{
 		Subject:   req.Subject,
 		DeviceID:  req.DeviceID,
 		Action:    req.Action,
 		Domain:    domain,
 		ExpiresAt: expiresAt,
-	})
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "challenge_store_failed"})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, ChallengeResponse{
 		Challenge: challenge,
@@ -227,7 +228,7 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if reason := challengeStore.Consume(req); reason != "" {
+	if reason := consumeAccessChallenge(req); reason != "" {
 		appendAuditLog(req, nil, "challenge_rejected", http.StatusForbidden, reason, "")
 		writeJSON(w, http.StatusForbidden, map[string]any{
 			"allowed": false,
@@ -287,7 +288,10 @@ func handleLockAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 		return
 	}
 
-	appendAuditLog(req, &authzResp, "device_command_sent", http.StatusOK, "", "")
+	eventID := appendAuditLog(req, &authzResp, "device_command_sent", http.StatusOK, "", "")
+	if err := saveDeviceExecution(eventID, req, deviceResp, "ok"); err != nil {
+		log.Printf("device execution write failed: %v", err)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"allowed":       true,
@@ -309,7 +313,10 @@ func handleLightAction(w http.ResponseWriter, req AccessRequest, authzResp Authz
 		return
 	}
 
-	appendAuditLog(req, &authzResp, "device_command_sent", http.StatusOK, "", "")
+	eventID := appendAuditLog(req, &authzResp, "device_command_sent", http.StatusOK, "", "")
+	if err := saveDeviceExecution(eventID, req, deviceResp, "ok"); err != nil {
+		log.Printf("device execution write failed: %v", err)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"allowed":       true,
@@ -331,32 +338,21 @@ func handleReadSensor(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 		return
 	}
 
-	record := map[string]any{
-		"subject":      req.Subject,
-		"device_id":    req.DeviceID,
-		"action":       req.Action,
-		"authz_reason": authzResp.Reason,
-		"reading":      reading,
-		"persisted_at": time.Now().UTC().Format(time.RFC3339),
-	}
-
-	sinkPath := getenv("LOCAL_SINK_FILE", "../../testdata/data/local-sink.ndjson")
-	if err := appendNDJSON(sinkPath, record); err != nil {
-		appendAuditLog(req, &authzResp, "local_sink_write_failed", http.StatusInternalServerError, err.Error(), sinkPath)
+	eventID := appendAuditLog(req, &authzResp, "data_persisted", http.StatusOK, "", gatewayDBPath()+"#sensor_readings")
+	if err := saveSensorReading(eventID, req, authzResp, reading); err != nil {
+		appendAuditLog(req, &authzResp, "sensor_reading_write_failed", http.StatusInternalServerError, err.Error(), gatewayDBPath()+"#sensor_readings")
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error":   "local_sink_write_failed",
+			"error":   "sensor_reading_write_failed",
 			"details": err.Error(),
 		})
 		return
 	}
 
-	appendAuditLog(req, &authzResp, "data_persisted", http.StatusOK, "", sinkPath)
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"allowed":       true,
 		"reason":        authzResp.Reason,
 		"device_result": reading,
-		"persisted_to":  sinkPath,
+		"persisted_to":  gatewayDBPath() + "#sensor_readings",
 	})
 }
 
@@ -432,30 +428,223 @@ func getJSON(endpoint string, out any) error {
 	return nil
 }
 
-func appendNDJSON(path string, v any) error {
+func openGatewayDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return nil, err
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(gatewaySchema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
+
+const gatewaySchema = `
+CREATE TABLE IF NOT EXISTS access_challenges (
+	challenge TEXT PRIMARY KEY,
+	subject TEXT NOT NULL,
+	device_id TEXT NOT NULL,
+	action TEXT NOT NULL,
+	domain TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	consumed_at TEXT,
+	consumption_result TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_challenges_unconsumed
+ON access_challenges(challenge)
+WHERE consumed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS audit_events (
+	event_id TEXT PRIMARY KEY,
+	recorded_at TEXT NOT NULL,
+	subject TEXT,
+	device_id TEXT,
+	action TEXT,
+	credential_id TEXT,
+	outcome TEXT NOT NULL,
+	http_status INTEGER NOT NULL,
+	error TEXT,
+	raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS access_attempts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	event_id TEXT NOT NULL UNIQUE REFERENCES audit_events(event_id) ON DELETE CASCADE,
+	recorded_at TEXT NOT NULL,
+	subject TEXT,
+	device_id TEXT,
+	action TEXT,
+	credential_id TEXT,
+	authz_allow INTEGER,
+	authz_reason TEXT,
+	outcome TEXT NOT NULL,
+	http_status INTEGER NOT NULL,
+	error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS device_executions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	event_id TEXT NOT NULL REFERENCES audit_events(event_id) ON DELETE CASCADE,
+	recorded_at TEXT NOT NULL,
+	device_id TEXT NOT NULL,
+	action TEXT NOT NULL,
+	request_json TEXT NOT NULL,
+	response_json TEXT NOT NULL,
+	outcome TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sensor_readings (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	event_id TEXT NOT NULL REFERENCES audit_events(event_id) ON DELETE CASCADE,
+	recorded_at TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	device_id TEXT NOT NULL,
+	action TEXT NOT NULL,
+	authz_reason TEXT NOT NULL,
+	reading_json TEXT NOT NULL
+);
+`
+
+func saveAccessChallenge(challenge string, record ChallengeRecord) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := gatewayDB.Exec(`
+		INSERT INTO access_challenges (
+			challenge, subject, device_id, action, domain, expires_at, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, challenge, record.Subject, record.DeviceID, record.Action, record.Domain, record.ExpiresAt.Format(time.RFC3339), now)
+	return err
+}
+
+func consumeAccessChallenge(req AccessRequest) string {
+	if req.Challenge == "" {
+		return "presentation_challenge_required"
+	}
+
+	tx, err := gatewayDB.Begin()
+	if err != nil {
+		return "challenge_store_unavailable"
+	}
+	defer tx.Rollback()
+
+	var record ChallengeRecord
+	var consumedAt sql.NullString
+	row := tx.QueryRow(`
+		SELECT subject, device_id, action, domain, expires_at, consumed_at
+		FROM access_challenges
+		WHERE challenge = ?
+	`, req.Challenge)
+	var expiresAt string
+	if err := row.Scan(&record.Subject, &record.DeviceID, &record.Action, &record.Domain, &expiresAt, &consumedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return "challenge_replayed_or_unknown"
+		}
+		return "challenge_store_unavailable"
+	}
+	if consumedAt.Valid {
+		return "challenge_replayed_or_unknown"
+	}
+	parsedExpiry, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return "challenge_bad_expiry"
+	}
+	record.ExpiresAt = parsedExpiry
+
+	reason := validateConsumedChallenge(req, record)
+	result := "accepted"
+	if reason != "" {
+		result = reason
+	}
+
+	res, err := tx.Exec(`
+		UPDATE access_challenges
+		SET consumed_at = ?, consumption_result = ?
+		WHERE challenge = ? AND consumed_at IS NULL
+	`, time.Now().UTC().Format(time.RFC3339), result, req.Challenge)
+	if err != nil {
+		return "challenge_store_unavailable"
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return "challenge_store_unavailable"
+	}
+	if rows != 1 {
+		return "challenge_replayed_or_unknown"
+	}
+	if err := tx.Commit(); err != nil {
+		return "challenge_store_unavailable"
+	}
+
+	return reason
+}
+
+func validateConsumedChallenge(req AccessRequest, record ChallengeRecord) string {
+	now := time.Now().UTC()
+	if now.After(record.ExpiresAt) {
+		return "challenge_expired"
+	}
+	if record.Subject != req.Subject {
+		return "challenge_subject_mismatch"
+	}
+	if record.DeviceID != req.DeviceID {
+		return "challenge_device_mismatch"
+	}
+	if record.Action != req.Action {
+		return "challenge_action_mismatch"
+	}
+	if req.Presentation == nil || req.Presentation.Proof == nil {
+		return "presentation_proof_missing"
+	}
+	if req.Presentation.Proof.Challenge != req.Challenge {
+		return "presentation_challenge_mismatch"
+	}
+	if req.Presentation.Proof.Domain != record.Domain {
+		return "presentation_domain_mismatch"
+	}
+	return ""
+}
+
+func saveDeviceExecution(eventID string, req AccessRequest, response map[string]any, outcome string) error {
+	requestJSON, err := json.Marshal(DeviceCommand{DeviceID: req.DeviceID})
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	raw, err := json.Marshal(v)
+	responseJSON, err := json.Marshal(response)
 	if err != nil {
 		return err
 	}
+	_, err = gatewayDB.Exec(`
+		INSERT INTO device_executions (
+			event_id, recorded_at, device_id, action, request_json, response_json, outcome
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, eventID, time.Now().UTC().Format(time.RFC3339), req.DeviceID, req.Action, string(requestJSON), string(responseJSON), outcome)
+	return err
+}
 
-	if _, err := f.Write(raw); err != nil {
+func saveSensorReading(eventID string, req AccessRequest, authzResp AuthzResponse, reading map[string]any) error {
+	readingJSON, err := json.Marshal(reading)
+	if err != nil {
 		return err
 	}
-	if _, err := f.Write([]byte("\n")); err != nil {
-		return err
-	}
-
-	return nil
+	_, err = gatewayDB.Exec(`
+		INSERT INTO sensor_readings (
+			event_id, recorded_at, subject, device_id, action, authz_reason, reading_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, eventID, time.Now().UTC().Format(time.RFC3339), req.Subject, req.DeviceID, req.Action, authzResp.Reason, string(readingJSON))
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -493,65 +682,7 @@ func randomHex(size int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-func (s *ChallengeStore) Put(challenge string, record ChallengeRecord) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.deleteExpiredLocked(time.Now().UTC())
-	s.challenges[challenge] = record
-}
-
-func (s *ChallengeStore) Consume(req AccessRequest) string {
-	if req.Challenge == "" {
-		return "presentation_challenge_required"
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now().UTC()
-	s.deleteExpiredLocked(now)
-
-	record, ok := s.challenges[req.Challenge]
-	if !ok {
-		return "challenge_replayed_or_unknown"
-	}
-	delete(s.challenges, req.Challenge)
-
-	if now.After(record.ExpiresAt) {
-		return "challenge_expired"
-	}
-	if record.Subject != req.Subject {
-		return "challenge_subject_mismatch"
-	}
-	if record.DeviceID != req.DeviceID {
-		return "challenge_device_mismatch"
-	}
-	if record.Action != req.Action {
-		return "challenge_action_mismatch"
-	}
-	if req.Presentation == nil || req.Presentation.Proof == nil {
-		return "presentation_proof_missing"
-	}
-	if req.Presentation.Proof.Challenge != req.Challenge {
-		return "presentation_challenge_mismatch"
-	}
-	if req.Presentation.Proof.Domain != record.Domain {
-		return "presentation_domain_mismatch"
-	}
-
-	return ""
-}
-
-func (s *ChallengeStore) deleteExpiredLocked(now time.Time) {
-	for challenge, record := range s.challenges {
-		if now.After(record.ExpiresAt) {
-			delete(s.challenges, challenge)
-		}
-	}
-}
-
-func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string, status int, errText string, persistedTo string) {
+func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string, status int, errText string, persistedTo string) string {
 	now := time.Now().UTC()
 
 	record := AuditRecord{
@@ -580,10 +711,53 @@ func appendAuditLog(req AccessRequest, authzResp *AuthzResponse, outcome string,
 		record.AuthzReason = authzResp.Reason
 	}
 
-	path := getenv("AUDIT_LOG_FILE", "../../testdata/audit/audit.ndjson")
-	if err := appendNDJSON(path, record); err != nil {
+	if err := saveAuditRecord(record); err != nil {
 		log.Printf("audit log write failed: %v", err)
 	}
+	return record.EventID
+}
+
+func saveAuditRecord(record AuditRecord) error {
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+
+	tx, err := gatewayDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO audit_events (
+			event_id, recorded_at, subject, device_id, action, credential_id,
+			outcome, http_status, error, raw_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.EventID, record.RecordedAt, record.Subject, record.DeviceID, record.Action, record.CredentialID, record.Outcome, record.HTTPStatus, record.Error, string(raw))
+	if err != nil {
+		return err
+	}
+
+	var authzAllow any
+	if record.AuthzAllow != nil {
+		if *record.AuthzAllow {
+			authzAllow = 1
+		} else {
+			authzAllow = 0
+		}
+	}
+	_, err = tx.Exec(`
+		INSERT INTO access_attempts (
+			event_id, recorded_at, subject, device_id, action, credential_id,
+			authz_allow, authz_reason, outcome, http_status, error
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.EventID, record.RecordedAt, record.Subject, record.DeviceID, record.Action, record.CredentialID, authzAllow, record.AuthzReason, record.Outcome, record.HTTPStatus, record.Error)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func getenv(key, fallback string) string {
@@ -591,6 +765,10 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func gatewayDBPath() string {
+	return getenv("GATEWAY_DB_PATH", "../../runtime/gateway/gateway.db")
 }
 
 func credentialFromRequest(req AccessRequest) *Credential {

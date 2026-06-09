@@ -100,8 +100,8 @@ func DefaultSpecs() []ServiceSpec {
 				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
 				"TRUSTED_ISSUER=" + demoIssuerDID,
 				"GATEWAY_ID=gateway-home-1",
-				"POLICY_FILE=../../testdata/policies/devices.json",
-				"REVOCATION_FILE=../../testdata/revocations/revoked_ids.json",
+				"POLICY_FILE=../../configs/policies/devices.json",
+				"ISSUER_DB_PATH=../../runtime/issuer/issuer.db",
 			},
 		},
 		{
@@ -147,7 +147,7 @@ func DefaultSpecs() []ServiceSpec {
 				"LOCK_URL=http://127.0.0.1:8090",
 				"SENSOR_URL=http://127.0.0.1:8091",
 				"LIGHT_URL=http://127.0.0.1:8092",
-				"LOCAL_SINK_FILE=../../testdata/data/local-sink.ndjson",
+				"GATEWAY_DB_PATH=../../runtime/gateway/gateway.db",
 			},
 		},
 		{
@@ -161,8 +161,7 @@ func DefaultSpecs() []ServiceSpec {
 				"OWNER_ISSUANCE_TOKEN=" + demoOwnerIssuanceToken,
 				"ISSUER_ED25519_SEED_HEX=" + demoIssuerSeedHex,
 				"ISSUER_DID=" + demoIssuerDID,
-				"SAVE_CREDENTIALS_DIR=../../testdata/credentials",
-				"REVOCATION_FILE=../../testdata/revocations/revoked_ids.json",
+				"ISSUER_DB_PATH=../../runtime/issuer/issuer.db",
 			},
 		},
 		{
@@ -174,6 +173,7 @@ func DefaultSpecs() []ServiceSpec {
 				"WALLET_ADDR=127.0.0.1:8083",
 				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
 				"WALLET_ED25519_SEED_HEX=" + demoWalletSeedHex,
+				"WALLET_DB_PATH=../../runtime/wallet/wallet.db",
 			},
 		},
 	}

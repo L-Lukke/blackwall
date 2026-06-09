@@ -75,13 +75,13 @@ Use `did:key` for the initial DID method.
 
 `did:key` keeps DID resolution deterministic and local. It avoids adding a registry, web hosting dependency, or external resolver while still providing a real DID method and a DID document/resolver boundary. The authorization service resolves issuer and holder verification methods through a resolver module instead of accepting raw public keys in the access request.
 
-Use stateful gateway challenges.
+Use durable, stateful gateway challenges.
 
-The gateway stores issued VP challenges in memory with subject, device, action, domain, and expiry metadata. A challenge is consumed on first use, so replaying the same VP is denied.
+The gateway stores issued VP challenges in SQLite with subject, device, action, domain, expiry, and consumption metadata. Challenge values are unique, and consumption is an atomic update that only succeeds for an unconsumed row, so replaying the same VP is denied.
 
-Use file-backed revocation and policy fixtures for the PoC.
+Use SQLite-backed security state and file-backed policy fixtures for the PoC.
 
-Revocation is represented by `testdata/revocations/revoked_ids.json`. Device policy is represented by `testdata/policies/devices.json`. These are intentionally simple, inspectable fixtures for local scenario runs.
+Credentials, credential scopes, issuer challenges, delegations, ownership transfers, and revocations are represented in `runtime/issuer/issuer.db`. Gateway challenges, access attempts, audit events, device executions, and sensor readings are represented in `runtime/gateway/gateway.db`. Wallet-held credentials and wallet/key metadata are represented in `runtime/wallet/wallet.db`. Device policy remains represented by `configs/policies/devices.json` as a simple, inspectable fixture for local scenario runs.
 
 ## Consequences
 
@@ -93,16 +93,17 @@ Revocation is represented by `testdata/revocations/revoked_ids.json`. Device pol
 - `did:key` provides real DID-derived verification keys without network dependencies.
 - Challenge-bound VPs prove holder control of the holder DID key.
 - Issuer-side authority changes prove holder control with challenge-bound owner VPs instead of raw credential submission.
-- One-time challenge consumption gives basic replay protection.
-- Local files keep policy and revocation easy to inspect during demos.
+- One-time durable challenge consumption gives basic replay protection across process restarts.
+- Transactional SQLite state makes revocation, ownership transfer, audit, and challenge handling easier to inspect and less prone to partial writes.
+- Local files keep policy easy to inspect during demos.
 
 ### Trade-offs
 
 - `did:key` is less operationally realistic than `did:web` or registry-backed DID methods for issuer governance.
-- The wallet is an in-memory/local service, not a production wallet.
-- Gateway challenge state is in memory and is lost on restart.
+- The wallet is still a local demo service, not a production wallet.
 - Challenge state is not shared across multiple gateway instances.
-- Revocation is custom and file-backed, not a standards-aligned Status List implementation.
+- Revocation is custom and SQLite-backed, not a standards-aligned Status List implementation.
+- SQLite is local-process friendly but is not a distributed state backend for multi-gateway deployments.
 - Proof handling is pragmatic JSON signing, not full VC Data Integrity canonicalization.
 - The authorization service is still mostly a PoC verifier, not a general-purpose SSI verifier.
 
@@ -123,7 +124,6 @@ The current VP flow checks:
 
 The current PoC does not yet provide:
 
-- Durable challenge storage.
 - Multi-gateway challenge replication.
 - Full DID method support beyond `did:key`.
 - Standards-aligned Status List revocation.
@@ -135,7 +135,6 @@ The current PoC does not yet provide:
 Likely next ADRs:
 
 - Whether to add `did:web` for issuer identity.
-- Whether to replace file-backed revocation with a Status List model.
-- Whether to make challenge storage durable.
+- Whether to replace SQLite-backed revocation with a Status List model.
 - Whether to introduce a real presentation exchange protocol.
 - How to model local household policy management.

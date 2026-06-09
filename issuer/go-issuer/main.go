@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,10 +11,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const challengeTTL = 5 * time.Minute
@@ -131,22 +132,14 @@ type credentialChallengeRecord struct {
 }
 
 type credentialChallengeStore struct {
-	mu         sync.Mutex
 	challenges map[string]credentialChallengeRecord
-}
-
-type Revocations struct {
-	RevokedIDs []string `json:"revoked_ids"`
-}
-
-var issuerChallenges = &credentialChallengeStore{
-	challenges: map[string]credentialChallengeRecord{},
 }
 
 var (
 	issuerSigningKey         ed25519.PrivateKey
 	configuredIssuerDID      string
 	issuerVerificationMethod string
+	issuerDB                 *sql.DB
 )
 
 func main() {
@@ -155,6 +148,13 @@ func main() {
 	issuerVerificationMethod = getenv("ISSUER_VERIFICATION_METHOD", configuredIssuerDID+"#key-1")
 	requireEnv("SERVICE_AUTH_TOKEN")
 	requireEnv("OWNER_ISSUANCE_TOKEN")
+
+	var err error
+	issuerDB, err = openIssuerDB(issuerDBPath())
+	if err != nil {
+		log.Fatalf("open issuer db: %v", err)
+	}
+	defer issuerDB.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
@@ -201,12 +201,15 @@ func credentialChallengeHandler(w http.ResponseWriter, r *http.Request) {
 
 	domain := configuredIssuerDID
 	expiresAt := time.Now().UTC().Add(challengeTTL)
-	issuerChallenges.Put(challenge, credentialChallengeRecord{
+	if err := saveIssuerChallenge(challenge, credentialChallengeRecord{
 		Subject:   req.Subject,
 		Operation: req.Operation,
 		Domain:    domain,
 		ExpiresAt: expiresAt,
-	})
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "challenge_store_failed"})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, CredentialChallengeResponse{
 		Challenge: challenge,
@@ -243,7 +246,10 @@ func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	cred := newCredential("OwnerCredential", req.Subject, req.Gateway, req.DeviceScopes, req.ActionScopes, now, now.Add(365*24*time.Hour))
 	cred.Proof = signCredential(cred, now)
 
-	saveCredential(cred)
+	if err := saveCredential(cred); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "credential_store_failed"})
+		return
+	}
 	writeJSON(w, http.StatusOK, cred)
 }
 
@@ -313,7 +319,10 @@ func delegationCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	cred.CredentialSubject.ParentCredentialID = owner.ID
 	cred.Proof = signCredential(cred, now)
 
-	saveCredential(cred)
+	if err := saveDelegationCredential(cred); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "credential_store_failed"})
+		return
+	}
 	writeJSON(w, http.StatusOK, cred)
 }
 
@@ -362,27 +371,17 @@ func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	revocations, err := loadRevocations(revocationFile())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
+	if err := revokeCredential(req.CredentialID, req.RevokedBy, owner.ID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_store_failed"})
 		return
 	}
-
-	if !contains(revocations.RevokedIDs, req.CredentialID) {
-		revocations.RevokedIDs = append(revocations.RevokedIDs, req.CredentialID)
-		sort.Strings(revocations.RevokedIDs)
-	}
-
-	if err := saveRevocations(revocationFile(), revocations); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_write_failed"})
-		return
-	}
+	revokedIDs, _ := loadRevokedIDs()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"credential_id": req.CredentialID,
 		"revoked_by":    req.RevokedBy,
-		"revoked_ids":   revocations.RevokedIDs,
+		"revoked_ids":   revokedIDs,
 	})
 }
 
@@ -427,12 +426,12 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	revocations, err := loadRevocations(revocationFile())
+	revoked, err := isCredentialRevoked(owner.ID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_store_failed"})
 		return
 	}
-	if contains(revocations.RevokedIDs, owner.ID) {
+	if revoked {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_already_revoked"})
 		return
 	}
@@ -460,15 +459,10 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 	newCred.CredentialSubject.ReplacesCredentialID = owner.ID
 	newCred.Proof = signCredential(newCred, now)
 
-	revocations.RevokedIDs = appendUnique(revocations.RevokedIDs, owner.ID)
-	sort.Strings(revocations.RevokedIDs)
-
-	if err := saveRevocations(revocationFile(), revocations); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_write_failed"})
+	if err := transferOwnership(owner, newCred, req.TransferredBy, req.NewSubject); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "ownership_transfer_store_failed"})
 		return
 	}
-
-	saveCredential(newCred)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                    true,
@@ -483,21 +477,13 @@ func verifiedOwnerPresentation(w http.ResponseWriter, subject, operation, challe
 		return Credential{}, false
 	}
 
-	record, ok := issuerChallenges.Consume(challenge)
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_replayed_or_unknown"})
+	record, reason, err := consumeIssuerChallenge(challenge, subject, operation)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "challenge_store_failed"})
 		return Credential{}, false
 	}
-	if time.Now().UTC().After(record.ExpiresAt) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_expired"})
-		return Credential{}, false
-	}
-	if record.Subject != subject {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_subject_mismatch"})
-		return Credential{}, false
-	}
-	if record.Operation != operation {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "challenge_operation_mismatch"})
+	if reason != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": reason})
 		return Credential{}, false
 	}
 
@@ -551,12 +537,12 @@ func verifiedOwnerPresentation(w http.ResponseWriter, subject, operation, challe
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_bad_signature"})
 		return Credential{}, false
 	}
-	revocations, err := loadRevocations(revocationFile())
+	revoked, err := isCredentialRevoked(owner.ID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_store_failed"})
 		return Credential{}, false
 	}
-	if contains(revocations.RevokedIDs, owner.ID) {
+	if revoked {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_revoked"})
 		return Credential{}, false
 	}
@@ -772,34 +758,26 @@ func contains(values []string, wanted string) bool {
 	return false
 }
 
-func appendUnique(values []string, wanted string) []string {
-	if contains(values, wanted) {
-		return values
-	}
-	return append(values, wanted)
-}
-
-func saveCredential(cred Credential) {
-	dir := credentialStoreDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	path := fmt.Sprintf("%s/%s.json", strings.TrimRight(dir, "/"), cred.ID)
-	raw, err := json.Marshal(cred)
+func saveCredential(cred Credential) error {
+	tx, err := issuerDB.Begin()
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(path, raw, 0o644)
+	defer tx.Rollback()
+	if err := saveCredentialTx(tx, cred); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func loadCredential(id string) (Credential, error) {
 	var cred Credential
-	path := fmt.Sprintf("%s/%s.json", strings.TrimRight(credentialStoreDir(), "/"), id)
-	raw, err := os.ReadFile(path)
+	var raw string
+	err := issuerDB.QueryRow(`SELECT raw_json FROM credentials WHERE id = ?`, id).Scan(&raw)
 	if err != nil {
 		return cred, err
 	}
-	if err := json.Unmarshal(raw, &cred); err != nil {
+	if err := json.Unmarshal([]byte(raw), &cred); err != nil {
 		return cred, err
 	}
 	return cred, nil
@@ -825,60 +803,292 @@ func ownerAuthorizedOverTarget(owner, target Credential) bool {
 	return false
 }
 
-func loadRevocations(path string) (Revocations, error) {
-	var revocations Revocations
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return Revocations{RevokedIDs: []string{}}, nil
-		}
-		return revocations, err
-	}
-
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return Revocations{RevokedIDs: []string{}}, nil
-	}
-
-	if err := json.Unmarshal(raw, &revocations); err != nil {
-		return revocations, err
-	}
-
-	if revocations.RevokedIDs == nil {
-		revocations.RevokedIDs = []string{}
-	}
-	return revocations, nil
-}
-
-func saveRevocations(path string, revocations Revocations) error {
+func openIssuerDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(issuerSchema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+const issuerSchema = `
+CREATE TABLE IF NOT EXISTS credentials (
+	id TEXT PRIMARY KEY,
+	kind TEXT NOT NULL,
+	issuer TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	gateway TEXT NOT NULL,
+	valid_from TEXT NOT NULL,
+	valid_until TEXT NOT NULL,
+	status TEXT NOT NULL,
+	raw_json TEXT NOT NULL,
+	proof_json TEXT,
+	created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS credential_scopes (
+	credential_id TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+	scope_type TEXT NOT NULL CHECK (scope_type IN ('device', 'action')),
+	scope TEXT NOT NULL,
+	PRIMARY KEY (credential_id, scope_type, scope)
+);
+
+CREATE TABLE IF NOT EXISTS issuer_challenges (
+	challenge TEXT PRIMARY KEY,
+	subject TEXT NOT NULL,
+	operation TEXT NOT NULL,
+	domain TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	consumed_at TEXT,
+	consumption_result TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_issuer_challenges_unconsumed
+ON issuer_challenges(challenge)
+WHERE consumed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS revocations (
+	credential_id TEXT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
+	revoked_by TEXT NOT NULL,
+	owner_credential_id TEXT NOT NULL,
+	revoked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delegations (
+	credential_id TEXT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
+	delegated_by TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	parent_credential_id TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+	created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ownership_transfers (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	old_credential_id TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+	new_credential_id TEXT NOT NULL UNIQUE REFERENCES credentials(id) ON DELETE CASCADE,
+	transferred_by TEXT NOT NULL,
+	new_subject TEXT NOT NULL,
+	transferred_at TEXT NOT NULL
+);
+`
+
+func saveIssuerChallenge(challenge string, record credentialChallengeRecord) error {
+	_, err := issuerDB.Exec(`
+		INSERT INTO issuer_challenges (
+			challenge, subject, operation, domain, expires_at, created_at
+		) VALUES (?, ?, ?, ?, ?, ?)
+	`, challenge, record.Subject, record.Operation, record.Domain, record.ExpiresAt.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func consumeIssuerChallenge(challenge, subject, operation string) (credentialChallengeRecord, string, error) {
+	tx, err := issuerDB.Begin()
+	if err != nil {
+		return credentialChallengeRecord{}, "", err
+	}
+	defer tx.Rollback()
+
+	var record credentialChallengeRecord
+	var expiresAt string
+	var consumedAt sql.NullString
+	err = tx.QueryRow(`
+		SELECT subject, operation, domain, expires_at, consumed_at
+		FROM issuer_challenges
+		WHERE challenge = ?
+	`, challenge).Scan(&record.Subject, &record.Operation, &record.Domain, &expiresAt, &consumedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return credentialChallengeRecord{}, "challenge_replayed_or_unknown", nil
+		}
+		return credentialChallengeRecord{}, "", err
+	}
+	if consumedAt.Valid {
+		return credentialChallengeRecord{}, "challenge_replayed_or_unknown", nil
+	}
+	record.ExpiresAt, err = time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return credentialChallengeRecord{}, "challenge_bad_expiry", nil
 	}
 
-	raw, err := json.MarshalIndent(revocations, "", "  ")
+	reason := ""
+	if time.Now().UTC().After(record.ExpiresAt) {
+		reason = "challenge_expired"
+	} else if record.Subject != subject {
+		reason = "challenge_subject_mismatch"
+	} else if record.Operation != operation {
+		reason = "challenge_operation_mismatch"
+	}
+	result := "accepted"
+	if reason != "" {
+		result = reason
+	}
+
+	res, err := tx.Exec(`
+		UPDATE issuer_challenges
+		SET consumed_at = ?, consumption_result = ?
+		WHERE challenge = ? AND consumed_at IS NULL
+	`, time.Now().UTC().Format(time.RFC3339), result, challenge)
+	if err != nil {
+		return credentialChallengeRecord{}, "", err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return credentialChallengeRecord{}, "", err
+	}
+	if rows != 1 {
+		return credentialChallengeRecord{}, "challenge_replayed_or_unknown", nil
+	}
+	if err := tx.Commit(); err != nil {
+		return credentialChallengeRecord{}, "", err
+	}
+	return record, reason, nil
+}
+
+func saveDelegationCredential(cred Credential) error {
+	tx, err := issuerDB.Begin()
 	if err != nil {
 		return err
 	}
-
-	return os.WriteFile(path, raw, 0o644)
-}
-
-func (s *credentialChallengeStore) Put(challenge string, record credentialChallengeRecord) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.challenges[challenge] = record
-}
-
-func (s *credentialChallengeStore) Consume(challenge string) (credentialChallengeRecord, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record, ok := s.challenges[challenge]
-	if ok {
-		delete(s.challenges, challenge)
+	defer tx.Rollback()
+	if err := saveCredentialTx(tx, cred); err != nil {
+		return err
 	}
-	return record, ok
+	_, err = tx.Exec(`
+		INSERT INTO delegations (
+			credential_id, delegated_by, subject, parent_credential_id, created_at
+		) VALUES (?, ?, ?, ?, ?)
+	`, cred.ID, cred.CredentialSubject.DelegatedBy, cred.CredentialSubject.ID, cred.CredentialSubject.ParentCredentialID, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveCredentialTx(tx *sql.Tx, cred Credential) error {
+	raw, err := json.Marshal(cred)
+	if err != nil {
+		return err
+	}
+	var proofJSON any
+	if cred.Proof != nil {
+		proofRaw, err := json.Marshal(cred.Proof)
+		if err != nil {
+			return err
+		}
+		proofJSON = string(proofRaw)
+	}
+	_, err = tx.Exec(`
+		INSERT INTO credentials (
+			id, kind, issuer, subject, gateway, valid_from, valid_until, status,
+			raw_json, proof_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, cred.ID, credentialKind(cred), cred.Issuer, cred.CredentialSubject.ID, cred.CredentialSubject.Gateway,
+		cred.ValidFrom, cred.ValidUntil, cred.CredentialStatus.Status, string(raw), proofJSON, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return err
+	}
+	for _, scope := range cred.CredentialSubject.DeviceScopes {
+		if _, err := tx.Exec(`INSERT INTO credential_scopes (credential_id, scope_type, scope) VALUES (?, 'device', ?)`, cred.ID, scope); err != nil {
+			return err
+		}
+	}
+	for _, scope := range cred.CredentialSubject.ActionScopes {
+		if _, err := tx.Exec(`INSERT INTO credential_scopes (credential_id, scope_type, scope) VALUES (?, 'action', ?)`, cred.ID, scope); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func revokeCredential(credentialID, revokedBy, ownerCredentialID string) error {
+	tx, err := issuerDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO revocations (
+			credential_id, revoked_by, owner_credential_id, revoked_at
+		) VALUES (?, ?, ?, ?)
+	`, credentialID, revokedBy, ownerCredentialID, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func transferOwnership(oldCred, newCred Credential, transferredBy, newSubject string) error {
+	tx, err := issuerDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := saveCredentialTx(tx, newCred); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO revocations (
+			credential_id, revoked_by, owner_credential_id, revoked_at
+		) VALUES (?, ?, ?, ?)
+	`, oldCred.ID, transferredBy, oldCred.ID, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO ownership_transfers (
+			old_credential_id, new_credential_id, transferred_by, new_subject, transferred_at
+		) VALUES (?, ?, ?, ?, ?)
+	`, oldCred.ID, newCred.ID, transferredBy, newSubject, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func isCredentialRevoked(id string) (bool, error) {
+	var exists int
+	err := issuerDB.QueryRow(`SELECT 1 FROM revocations WHERE credential_id = ?`, id).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func loadRevokedIDs() ([]string, error) {
+	rows, err := issuerDB.Query(`SELECT credential_id FROM revocations ORDER BY credential_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func credentialKind(cred Credential) string {
+	for _, t := range cred.Type {
+		if t != "VerifiableCredential" {
+			return t
+		}
+	}
+	return ""
 }
 
 func newChallenge() (string, error) {
@@ -963,12 +1173,8 @@ func validOwnerIssuanceToken(r *http.Request) bool {
 	return r.Header.Get("X-Blackwall-Owner-Issuance-Token") == os.Getenv("OWNER_ISSUANCE_TOKEN")
 }
 
-func revocationFile() string {
-	return getenv("REVOCATION_FILE", "../../testdata/revocations/revoked_ids.json")
-}
-
-func credentialStoreDir() string {
-	return getenv("SAVE_CREDENTIALS_DIR", "../../testdata/credentials")
+func issuerDBPath() string {
+	return getenv("ISSUER_DB_PATH", "../../runtime/issuer/issuer.db")
 }
 
 func requireEnv(key string) {

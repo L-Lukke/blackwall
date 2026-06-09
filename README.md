@@ -29,8 +29,8 @@ flowchart LR
     Gateway["Gateway API<br/>(Go)<br/>Challenges + mediates access"]
     Authz["Authorization Service<br/>(Rust)<br/>Verifies VP/VC + policy"]
     Resolver["DID Resolver Boundary<br/>did:key -> DID Document"]
-    Policy["Local Policy Fixture<br/>testdata/policies/devices.json"]
-    Revocation["Revocation Fixture<br/>testdata/revocations/revoked_ids.json"]
+    Policy["Local Policy Fixture<br/>configs/policies/devices.json"]
+    State["SQLite Runtime State<br/>runtime/*/*.db"]
     Devices["Device Simulators<br/>Lock / Light / Sensor"]
 
     Issuer -- "1. Issue VC to holder did:key" --> Wallet
@@ -41,7 +41,10 @@ flowchart LR
 
     Authz -- "Resolve issuer + holder keys" --> Resolver
     Authz -- "Check device/action policy" --> Policy
-    Authz -- "Check credential revocation" --> Revocation
+    Authz -- "Check credential revocation" --> State
+    Gateway -- "Persist challenges + audit" --> State
+    Issuer -- "Persist credentials + revocations" --> State
+    Wallet -- "Persist holder credentials" --> State
 
     Authz -- "6. allow / deny" --> Gateway
     Gateway -- "7. Execute only if allowed" --> Devices
@@ -67,8 +70,9 @@ flowchart LR
 - VC-shaped SSI credentials with DID issuers, holder subjects, credential status, and Ed25519 Data Integrity proofs
 - `did:key` resolution behind a DID document/resolver boundary for issuer and holder verification keys
 - Holder wallet and challenge-bound verifiable presentation flow
-- Stateful VP challenges with expiry, subject/device/action binding, and one-time consumption
+- Durable SQLite-backed VP challenges with expiry, subject/device/action binding, and one-time atomic consumption
 - Issuer-side delegation, revocation, and ownership-transfer operations require challenge-bound owner VPs
+- SQLite-backed credentials, revocations, audit events, device executions, sensor readings, and wallet state
 
 ### To be implemented
 
@@ -96,6 +100,7 @@ Make sure the following tools are available locally:
 
 - `go`
 - `cargo`
+- a C toolchain for the Go SQLite driver
 
 Also run all commands from the **repository root**, unless noted otherwise.
 
@@ -163,6 +168,41 @@ scenarios/.logs/
 
 These logs are runtime output and are intentionally ignored by git.
 
+### Runtime databases
+
+Security and scenario state is stored in local SQLite databases:
+
+```text
+GATEWAY_DB_PATH=runtime/gateway/gateway.db
+ISSUER_DB_PATH=runtime/issuer/issuer.db
+WALLET_DB_PATH=runtime/wallet/wallet.db
+```
+
+The orchestrator sets these paths for managed services. The services create their schemas on startup.
+
+`gateway.db` contains:
+
+* `access_challenges`
+* `audit_events`
+* `access_attempts`
+* `device_executions`
+* `sensor_readings`
+
+`issuer.db` contains:
+
+* `credentials`
+* `credential_scopes`
+* `issuer_challenges`
+* `revocations`
+* `delegations`
+* `ownership_transfers`
+
+`wallet.db` contains:
+
+* `credentials`
+* `wallet_metadata`
+* `key_metadata`
+
 ### Expected scenario outcomes
 
 #### Owner control
@@ -221,7 +261,7 @@ Authorization service: resolve issuer/holder did:key values, verify VC + VP proo
 Gateway -> Device simulator: execute command only after allow
 ```
 
-The gateway stores VP challenges in memory with subject, device, action, domain, and expiry metadata. A challenge is consumed on first use, so replaying the same VP challenge is denied. This is still PoC-grade state: challenges are not durable across gateway restarts and are not shared across multiple gateway instances.
+The gateway stores VP challenges durably in `gateway.db` with subject, device, action, domain, expiry, and consumption metadata. Challenge values are unique, and consumption is an atomic database update, so replaying the same VP challenge is denied even after process restart.
 
 ### Version-control hygiene
 
@@ -229,11 +269,9 @@ The repository tracks source code, lockfiles, policy fixtures, and empty fixture
 
 * Rust build output under `gateway/rust-authz/target/`
 * Orchestrator logs under `scenarios/.logs/`
-* Issued credential JSON files under `testdata/credentials/`
-* Audit logs under `testdata/audit/`
-* Local sensor sink output under `testdata/data/*.ndjson`
+* Runtime SQLite databases and WAL/SHM files under `runtime/`
 
-To reset runtime state between manual scenario runs, remove generated files from those ignored paths. The seed policy and revocation fixture files under `testdata/policies/` and `testdata/revocations/` are kept in version control.
+To reset runtime state between manual scenario runs, remove the generated databases under `runtime/`. The seed policy fixture under `configs/policies/` is kept in version control.
 
 ### Notes
 

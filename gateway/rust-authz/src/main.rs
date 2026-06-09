@@ -9,6 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use did::DidKeyResolver;
 use ed25519_dalek::{Signature, Verifier};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, fs, sync::Arc};
 
@@ -17,7 +18,7 @@ struct AppState {
     trusted_issuer: String,
     gateway_id: String,
     policy_file: String,
-    revocation_file: String,
+    issuer_db_path: String,
     service_auth_token: String,
 }
 
@@ -190,11 +191,6 @@ struct AuthzResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct Revocations {
-    revoked_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct Policies {
     devices: HashMap<String, DevicePolicy>,
 }
@@ -210,9 +206,9 @@ async fn main() {
         trusted_issuer: required_env("TRUSTED_ISSUER"),
         gateway_id: env::var("GATEWAY_ID").unwrap_or_else(|_| "gateway-home-1".to_string()),
         policy_file: env::var("POLICY_FILE")
-            .unwrap_or_else(|_| "../../testdata/policies/devices.json".to_string()),
-        revocation_file: env::var("REVOCATION_FILE")
-            .unwrap_or_else(|_| "../../testdata/revocations/revoked_ids.json".to_string()),
+            .unwrap_or_else(|_| "../../configs/policies/devices.json".to_string()),
+        issuer_db_path: env::var("ISSUER_DB_PATH")
+            .unwrap_or_else(|_| "../../runtime/issuer/issuer.db".to_string()),
         service_auth_token: required_env("SERVICE_AUTH_TOKEN"),
     });
 
@@ -405,7 +401,7 @@ fn validate_common(state: &AppState, req: &AuthzRequest, cred: &Credential) -> R
     if is_expired(&cred.valid_until)? {
         return Err("credential_expired".to_string());
     }
-    if is_revoked(&state.revocation_file, &cred.id)? {
+    if is_revoked(&state.issuer_db_path, &cred.id)? {
         return Err("credential_revoked".to_string());
     }
     if !verify_credential_signature(cred) {
@@ -504,13 +500,19 @@ fn policy_allows(policy_file: &str, device_id: &str, action: &str) -> Result<boo
     Ok(device_policy.allowed_actions.iter().any(|a| a == action))
 }
 
-fn is_revoked(revocation_file: &str, credential_id: &str) -> Result<bool, String> {
-    let raw = fs::read_to_string(revocation_file)
-        .map_err(|e| format!("revocation_file_read_error: {}", e))?;
-    let revocations: Revocations =
-        serde_json::from_str(&raw).map_err(|e| format!("revocation_file_parse_error: {}", e))?;
+fn is_revoked(issuer_db_path: &str, credential_id: &str) -> Result<bool, String> {
+    let conn =
+        Connection::open(issuer_db_path).map_err(|e| format!("issuer_db_open_error: {}", e))?;
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM revocations WHERE credential_id = ?1",
+            [credential_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("issuer_db_revocation_query_error: {}", e))?;
 
-    Ok(revocations.revoked_ids.iter().any(|id| id == credential_id))
+    Ok(found.is_some())
 }
 
 fn verify_credential_signature(cred: &Credential) -> bool {
