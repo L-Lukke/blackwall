@@ -143,7 +143,19 @@ var issuerChallenges = &credentialChallengeStore{
 	challenges: map[string]credentialChallengeRecord{},
 }
 
+var (
+	issuerSigningKey         ed25519.PrivateKey
+	configuredIssuerDID      string
+	issuerVerificationMethod string
+)
+
 func main() {
+	issuerSigningKey = mustLoadEd25519PrivateKey("ISSUER_ED25519_PRIVATE_KEY_HEX", "ISSUER_ED25519_SEED_HEX")
+	configuredIssuerDID = getenv("ISSUER_DID", didKeyFromPublicKey(issuerSigningKey.Public().(ed25519.PublicKey)))
+	issuerVerificationMethod = getenv("ISSUER_VERIFICATION_METHOD", configuredIssuerDID+"#key-1")
+	requireEnv("SERVICE_AUTH_TOKEN")
+	requireEnv("OWNER_ISSUANCE_TOKEN")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/credentials/challenge", credentialChallengeHandler)
@@ -152,9 +164,9 @@ func main() {
 	mux.HandleFunc("/credentials/revoke", revokeCredentialHandler)
 	mux.HandleFunc("/credentials/transfer", transferOwnershipHandler)
 
-	addr := getenv("ISSUER_ADDR", ":8082")
+	addr := getenv("ISSUER_ADDR", "127.0.0.1:8082")
 	log.Printf("go-issuer listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, serviceAuthMiddleware(mux)))
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
@@ -187,7 +199,7 @@ func credentialChallengeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	domain := getenv("ISSUER_DID", defaultIssuerDID())
+	domain := configuredIssuerDID
 	expiresAt := time.Now().UTC().Add(challengeTTL)
 	issuerChallenges.Put(challenge, credentialChallengeRecord{
 		Subject:   req.Subject,
@@ -206,6 +218,10 @@ func credentialChallengeHandler(w http.ResponseWriter, r *http.Request) {
 func ownerCredentialHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+	if !validOwnerIssuanceToken(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "owner_issuance_auth_required"})
 		return
 	}
 
@@ -332,8 +348,21 @@ func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := getenv("REVOCATION_FILE", "../../testdata/revocations/revoked_ids.json")
-	revocations, err := loadRevocations(path)
+	target, err := loadCredential(req.CredentialID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "target_credential_not_found"})
+		return
+	}
+	if !ownerAuthorizedOverTarget(owner, target) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "owner_not_authorized_for_target_credential"})
+		return
+	}
+	if target.Issuer != configuredIssuerDID || !verifySignature(target) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "target_credential_bad_signature"})
+		return
+	}
+
+	revocations, err := loadRevocations(revocationFile())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
 		return
@@ -344,7 +373,7 @@ func revokeCredentialHandler(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(revocations.RevokedIDs)
 	}
 
-	if err := saveRevocations(path, revocations); err != nil {
+	if err := saveRevocations(revocationFile(), revocations); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_write_failed"})
 		return
 	}
@@ -398,8 +427,7 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := getenv("REVOCATION_FILE", "../../testdata/revocations/revoked_ids.json")
-	revocations, err := loadRevocations(path)
+	revocations, err := loadRevocations(revocationFile())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
 		return
@@ -435,7 +463,7 @@ func transferOwnershipHandler(w http.ResponseWriter, r *http.Request) {
 	revocations.RevokedIDs = appendUnique(revocations.RevokedIDs, owner.ID)
 	sort.Strings(revocations.RevokedIDs)
 
-	if err := saveRevocations(path, revocations); err != nil {
+	if err := saveRevocations(revocationFile(), revocations); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_write_failed"})
 		return
 	}
@@ -515,8 +543,21 @@ func verifiedOwnerPresentation(w http.ResponseWriter, subject, operation, challe
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_not_active"})
 		return Credential{}, false
 	}
+	if owner.Issuer != configuredIssuerDID {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_issuer_not_trusted"})
+		return Credential{}, false
+	}
 	if !verifySignature(owner) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_bad_signature"})
+		return Credential{}, false
+	}
+	revocations, err := loadRevocations(revocationFile())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "revocation_file_load_failed"})
+		return Credential{}, false
+	}
+	if contains(revocations.RevokedIDs, owner.ID) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "owner_presentation_credential_revoked"})
 		return Credential{}, false
 	}
 
@@ -585,7 +626,7 @@ func newCredential(kind, subject, gateway string, deviceScopes, actionScopes []s
 		},
 		ID:         id,
 		Type:       []string{"VerifiableCredential", kind},
-		Issuer:     getenv("ISSUER_DID", defaultIssuerDID()),
+		Issuer:     configuredIssuerDID,
 		ValidFrom:  validFrom.Format(time.RFC3339),
 		ValidUntil: validUntil.Format(time.RFC3339),
 		CredentialSubject: CredentialSubject{
@@ -613,14 +654,12 @@ func signingInput(c Credential) []byte {
 }
 
 func signCredential(cred Credential, now time.Time) *Proof {
-	privateKey := issuerPrivateKey()
-	signature := ed25519.Sign(privateKey, signingInput(cred))
-	issuerDID := getenv("ISSUER_DID", defaultIssuerDID())
+	signature := ed25519.Sign(issuerSigningKey, signingInput(cred))
 	return &Proof{
 		Type:               "DataIntegrityProof",
 		Cryptosuite:        "eddsa-rdfc-2022",
 		Created:            now.Format(time.RFC3339),
-		VerificationMethod: getenv("ISSUER_VERIFICATION_METHOD", issuerDID+"#key-1"),
+		VerificationMethod: issuerVerificationMethod,
 		ProofPurpose:       "assertionMethod",
 		ProofValue:         hex.EncodeToString(signature),
 	}
@@ -634,11 +673,11 @@ func verifySignature(cred Credential) bool {
 	if err != nil {
 		return false
 	}
-	return ed25519.Verify(issuerPublicKey(), signingInput(cred), signature)
+	return ed25519.Verify(issuerSigningKey.Public().(ed25519.PublicKey), signingInput(cred), signature)
 }
 
-func issuerPrivateKey() ed25519.PrivateKey {
-	if rawHex := os.Getenv("ISSUER_ED25519_PRIVATE_KEY_HEX"); rawHex != "" {
+func mustLoadEd25519PrivateKey(privateKeyEnv, seedEnv string) ed25519.PrivateKey {
+	if rawHex := os.Getenv(privateKeyEnv); rawHex != "" {
 		raw, err := hex.DecodeString(rawHex)
 		if err == nil && len(raw) == ed25519.PrivateKeySize {
 			return ed25519.PrivateKey(raw)
@@ -647,26 +686,14 @@ func issuerPrivateKey() ed25519.PrivateKey {
 			return ed25519.NewKeyFromSeed(raw)
 		}
 	}
-	return ed25519.NewKeyFromSeed(defaultIssuerEd25519Seed())
-}
-
-func issuerPublicKey() ed25519.PublicKey {
-	if rawHex := os.Getenv("ISSUER_ED25519_PUBLIC_KEY_HEX"); rawHex != "" {
+	if rawHex := os.Getenv(seedEnv); rawHex != "" {
 		raw, err := hex.DecodeString(rawHex)
-		if err == nil && len(raw) == ed25519.PublicKeySize {
-			return ed25519.PublicKey(raw)
+		if err == nil && len(raw) == ed25519.SeedSize {
+			return ed25519.NewKeyFromSeed(raw)
 		}
 	}
-	return issuerPrivateKey().Public().(ed25519.PublicKey)
-}
-
-func defaultIssuerEd25519Seed() []byte {
-	seed, _ := hex.DecodeString("298754db2dbab6ec62605ceb0379eb7ee376580359449efe0caa3aa06cd56736")
-	return seed
-}
-
-func defaultIssuerDID() string {
-	return didKeyFromPublicKey(issuerPublicKey())
+	log.Fatalf("%s or %s must be set to a valid Ed25519 key", privateKeyEnv, seedEnv)
+	return nil
 }
 
 func didKeyFromPublicKey(publicKey ed25519.PublicKey) string {
@@ -753,10 +780,7 @@ func appendUnique(values []string, wanted string) []string {
 }
 
 func saveCredential(cred Credential) {
-	dir := os.Getenv("SAVE_CREDENTIALS_DIR")
-	if dir == "" {
-		return
-	}
+	dir := credentialStoreDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
@@ -766,6 +790,39 @@ func saveCredential(cred Credential) {
 		return
 	}
 	_ = os.WriteFile(path, raw, 0o644)
+}
+
+func loadCredential(id string) (Credential, error) {
+	var cred Credential
+	path := fmt.Sprintf("%s/%s.json", strings.TrimRight(credentialStoreDir(), "/"), id)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return cred, err
+	}
+	if err := json.Unmarshal(raw, &cred); err != nil {
+		return cred, err
+	}
+	return cred, nil
+}
+
+func ownerAuthorizedOverTarget(owner, target Credential) bool {
+	if owner.CredentialSubject.Gateway != target.CredentialSubject.Gateway {
+		return false
+	}
+	if !isSubset(target.CredentialSubject.DeviceScopes, owner.CredentialSubject.DeviceScopes) {
+		return false
+	}
+	if !isSubset(target.CredentialSubject.ActionScopes, owner.CredentialSubject.ActionScopes) {
+		return false
+	}
+	if hasType(target, "OwnerCredential") {
+		return target.ID == owner.ID
+	}
+	if hasType(target, "DelegationCredential") {
+		return target.CredentialSubject.ParentCredentialID == owner.ID ||
+			target.CredentialSubject.DelegatedBy == owner.CredentialSubject.ID
+	}
+	return false
 }
 
 func loadRevocations(path string) (Revocations, error) {
@@ -889,6 +946,35 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func serviceAuthMiddleware(next http.Handler) http.Handler {
+	token := os.Getenv("SERVICE_AUTH_TOKEN")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Blackwall-Service-Token") != token {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "service_auth_required"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func validOwnerIssuanceToken(r *http.Request) bool {
+	return r.Header.Get("X-Blackwall-Owner-Issuance-Token") == os.Getenv("OWNER_ISSUANCE_TOKEN")
+}
+
+func revocationFile() string {
+	return getenv("REVOCATION_FILE", "../../testdata/revocations/revoked_ids.json")
+}
+
+func credentialStoreDir() string {
+	return getenv("SAVE_CREDENTIALS_DIR", "../../testdata/credentials")
+}
+
+func requireEnv(key string) {
+	if os.Getenv(key) == "" {
+		log.Fatalf("%s must be set", key)
+	}
 }
 
 func getenv(key, fallback string) string {

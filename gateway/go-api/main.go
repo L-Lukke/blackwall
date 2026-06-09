@@ -150,14 +150,16 @@ type AuditRecord struct {
 }
 
 func main() {
+	requireEnv("SERVICE_AUTH_TOKEN")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/access/challenge", challengeHandler)
 	mux.HandleFunc("/access/request", accessRequestHandler)
 
-	addr := getenv("GATEWAY_ADDR", ":8080")
+	addr := getenv("GATEWAY_ADDR", "127.0.0.1:8080")
 	log.Printf("go-api listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, serviceAuthMiddleware(mux)))
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
@@ -236,7 +238,7 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 
 	var authzResp AuthzResponse
 	if err := postJSON(
-		getenv("AUTHZ_URL", "http://localhost:8081/v1/authorize"),
+		getenv("AUTHZ_URL", "http://127.0.0.1:8081/v1/authorize"),
 		req,
 		&authzResp,
 	); err != nil {
@@ -273,7 +275,7 @@ func accessRequestHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLockAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
-	deviceURL := getenv("LOCK_URL", "http://localhost:8090") + "/" + req.Action
+	deviceURL := getenv("LOCK_URL", "http://127.0.0.1:8090") + "/" + req.Action
 
 	var deviceResp map[string]any
 	if err := postJSON(deviceURL, DeviceCommand{DeviceID: req.DeviceID}, &deviceResp); err != nil {
@@ -295,7 +297,7 @@ func handleLockAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzR
 }
 
 func handleLightAction(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
-	deviceURL := getenv("LIGHT_URL", "http://localhost:8092") + "/" + req.Action
+	deviceURL := getenv("LIGHT_URL", "http://127.0.0.1:8092") + "/" + req.Action
 
 	var deviceResp map[string]any
 	if err := postJSON(deviceURL, DeviceCommand{DeviceID: req.DeviceID}, &deviceResp); err != nil {
@@ -317,7 +319,7 @@ func handleLightAction(w http.ResponseWriter, req AccessRequest, authzResp Authz
 }
 
 func handleReadSensor(w http.ResponseWriter, req AccessRequest, authzResp AuthzResponse) {
-	sensorURL := getenv("SENSOR_URL", "http://localhost:8091") + "/reading?device_id=" + url.QueryEscape(req.DeviceID)
+	sensorURL := getenv("SENSOR_URL", "http://127.0.0.1:8091") + "/reading?device_id=" + url.QueryEscape(req.DeviceID)
 
 	var reading map[string]any
 	if err := getJSON(sensorURL, &reading); err != nil {
@@ -369,6 +371,7 @@ func postJSON(endpoint string, in any, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setServiceAuthHeader(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -401,6 +404,7 @@ func getJSON(endpoint string, out any) error {
 	if err != nil {
 		return err
 	}
+	setServiceAuthHeader(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -458,6 +462,27 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func serviceAuthMiddleware(next http.Handler) http.Handler {
+	token := os.Getenv("SERVICE_AUTH_TOKEN")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Blackwall-Service-Token") != token {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "service_auth_required"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func setServiceAuthHeader(req *http.Request) {
+	req.Header.Set("X-Blackwall-Service-Token", os.Getenv("SERVICE_AUTH_TOKEN"))
+}
+
+func requireEnv(key string) {
+	if os.Getenv(key) == "" {
+		log.Fatalf("%s must be set", key)
+	}
 }
 
 func randomHex(size int) (string, error) {

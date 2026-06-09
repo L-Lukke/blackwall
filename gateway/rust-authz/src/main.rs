@@ -3,6 +3,7 @@ mod did;
 use axum::{
     Json, Router,
     extract::State,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -17,6 +18,7 @@ struct AppState {
     gateway_id: String,
     policy_file: String,
     revocation_file: String,
+    service_auth_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,14 +207,13 @@ struct DevicePolicy {
 #[tokio::main]
 async fn main() {
     let state = Arc::new(AppState {
-        trusted_issuer: env::var("TRUSTED_ISSUER").unwrap_or_else(|_| {
-            "did:key:z6MkqPsfMdhSg1HSGhoxJG9Pm16yEYZ7oGMJm6QVALhqM3m2".to_string()
-        }),
+        trusted_issuer: required_env("TRUSTED_ISSUER"),
         gateway_id: env::var("GATEWAY_ID").unwrap_or_else(|_| "gateway-home-1".to_string()),
         policy_file: env::var("POLICY_FILE")
             .unwrap_or_else(|_| "../../testdata/policies/devices.json".to_string()),
         revocation_file: env::var("REVOCATION_FILE")
             .unwrap_or_else(|_| "../../testdata/revocations/revoked_ids.json".to_string()),
+        service_auth_token: required_env("SERVICE_AUTH_TOKEN"),
     });
 
     let app = Router::new()
@@ -220,33 +221,66 @@ async fn main() {
         .route("/v1/authorize", post(authorize))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8081")
+    let addr = env::var("AUTHZ_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");
 
-    println!("rust-authz listening on http://0.0.0.0:8081");
+    println!("rust-authz listening on http://{}", addr);
     axum::serve(listener, app).await.expect("server failed");
 }
 
-async fn health() -> Json<AuthzResponse> {
-    Json(AuthzResponse {
-        allow: true,
-        reason: "ok".to_string(),
-    })
+async fn health(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<AuthzResponse>) {
+    if let Err(resp) = authenticate(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(resp));
+    }
+    (
+        StatusCode::OK,
+        Json(AuthzResponse {
+            allow: true,
+            reason: "ok".to_string(),
+        }),
+    )
 }
 
 async fn authorize(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<AuthzRequest>,
-) -> Json<AuthzResponse> {
+) -> (StatusCode, Json<AuthzResponse>) {
+    if let Err(resp) = authenticate(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(resp));
+    }
     match evaluate(&state, &req) {
-        Ok(reason) => Json(AuthzResponse {
-            allow: true,
-            reason,
-        }),
-        Err(reason) => Json(AuthzResponse {
+        Ok(reason) => (
+            StatusCode::OK,
+            Json(AuthzResponse {
+                allow: true,
+                reason,
+            }),
+        ),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(AuthzResponse {
+                allow: false,
+                reason,
+            }),
+        ),
+    }
+}
+
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), AuthzResponse> {
+    match headers
+        .get("x-blackwall-service-token")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(token) if token == state.service_auth_token => Ok(()),
+        _ => Err(AuthzResponse {
             allow: false,
-            reason,
+            reason: "service_auth_required".to_string(),
         }),
     }
 }
@@ -534,4 +568,11 @@ fn presentation_signing_input(presentation: &VerifiablePresentation) -> String {
 
 fn has_type(cred: &Credential, kind: &str) -> bool {
     cred.cred_type.iter().any(|t| t == kind)
+}
+
+fn required_env(key: &str) -> String {
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| panic!("{} must be set", key))
 }

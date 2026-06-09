@@ -90,6 +90,7 @@ type Wallet struct {
 }
 
 func main() {
+	requireEnv("SERVICE_AUTH_TOKEN")
 	wallet := newWallet()
 
 	mux := http.NewServeMux()
@@ -98,9 +99,9 @@ func main() {
 	mux.HandleFunc("/wallet/credentials", wallet.credentialsHandler)
 	mux.HandleFunc("/wallet/presentations", wallet.presentationsHandler)
 
-	addr := getenv("WALLET_ADDR", ":8083")
+	addr := getenv("WALLET_ADDR", "127.0.0.1:8083")
 	log.Printf("go-wallet listening on %s holder=%s", addr, wallet.did)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, serviceAuthMiddleware(mux)))
 }
 
 func newWallet() *Wallet {
@@ -236,8 +237,14 @@ func walletPrivateKey() ed25519.PrivateKey {
 		}
 	}
 
-	seed, _ := hex.DecodeString(getenv("WALLET_ED25519_SEED_HEX", "f6a36f36c806d12794d5c307809762fd1f95d32278c6ac2c742c7b6a9249fbd5"))
-	return ed25519.NewKeyFromSeed(seed)
+	if rawHex := os.Getenv("WALLET_ED25519_SEED_HEX"); rawHex != "" {
+		seed, err := hex.DecodeString(rawHex)
+		if err == nil && len(seed) == ed25519.SeedSize {
+			return ed25519.NewKeyFromSeed(seed)
+		}
+	}
+	log.Fatal("WALLET_ED25519_PRIVATE_KEY_HEX or WALLET_ED25519_SEED_HEX must be set to a valid Ed25519 key")
+	return nil
 }
 
 func didKeyFromPublicKey(publicKey ed25519.PublicKey) string {
@@ -284,6 +291,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func serviceAuthMiddleware(next http.Handler) http.Handler {
+	token := os.Getenv("SERVICE_AUTH_TOKEN")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Blackwall-Service-Token") != token {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "service_auth_required"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requireEnv(key string) {
+	if os.Getenv(key) == "" {
+		log.Fatalf("%s must be set", key)
+	}
 }
 
 func getenv(key, fallback string) string {

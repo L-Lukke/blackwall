@@ -19,13 +19,15 @@ type readingResponse struct {
 }
 
 func main() {
+	requireEnv("SERVICE_AUTH_TOKEN")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/reading", readingHandler)
 
-	addr := getenv("SENSOR_ADDR", ":8091")
+	addr := getenv("SENSOR_ADDR", "127.0.0.1:8091")
 	log.Printf("sensor-sim listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, serviceAuthMiddleware(mux)))
 }
 
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
@@ -73,6 +75,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func serviceAuthMiddleware(next http.Handler) http.Handler {
+	token := os.Getenv("SERVICE_AUTH_TOKEN")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Blackwall-Service-Token") != token {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "service_auth_required"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requireEnv(key string) {
+	if os.Getenv(key) == "" {
+		log.Fatalf("%s must be set", key)
+	}
 }
 
 func getenv(key, fallback string) string {

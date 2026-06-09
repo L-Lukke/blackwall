@@ -14,18 +14,20 @@ import (
 )
 
 type Config struct {
-	IssuerURL      string
-	GatewayURL     string
-	WalletURL      string
-	AuthzHealthURL string
-	LockURL        string
-	SensorURL      string
-	LightURL       string
-	GatewayID      string
-	DeviceID       string
-	SensorDeviceID string
-	LightDeviceID  string
-	Timeout        time.Duration
+	IssuerURL          string
+	GatewayURL         string
+	WalletURL          string
+	AuthzHealthURL     string
+	LockURL            string
+	SensorURL          string
+	LightURL           string
+	ServiceAuthToken   string
+	OwnerIssuanceToken string
+	GatewayID          string
+	DeviceID           string
+	SensorDeviceID     string
+	LightDeviceID      string
+	Timeout            time.Duration
 }
 
 type Client struct {
@@ -203,18 +205,20 @@ var scenarioActorKeys = map[string]ed25519.PrivateKey{}
 
 func LoadConfig() Config {
 	return Config{
-		IssuerURL:      getenv("ISSUER_URL", "http://127.0.0.1:8082"),
-		GatewayURL:     getenv("GATEWAY_URL", "http://127.0.0.1:8080"),
-		WalletURL:      getenv("WALLET_URL", "http://127.0.0.1:8083"),
-		AuthzHealthURL: getenv("AUTHZ_HEALTH_URL", "http://127.0.0.1:8081"),
-		LockURL:        getenv("LOCK_URL", "http://127.0.0.1:8090"),
-		SensorURL:      getenv("SENSOR_URL", "http://127.0.0.1:8091"),
-		LightURL:       getenv("LIGHT_URL", "http://127.0.0.1:8092"),
-		GatewayID:      getenv("GATEWAY_ID", "gateway-home-1"),
-		DeviceID:       getenv("DEVICE_ID", "lock-front-door"),
-		SensorDeviceID: getenv("SENSOR_DEVICE_ID", "sensor-living-room"),
-		LightDeviceID:  getenv("LIGHT_DEVICE_ID", "light-living-room"),
-		Timeout:        10 * time.Second,
+		IssuerURL:          getenv("ISSUER_URL", "http://127.0.0.1:8082"),
+		GatewayURL:         getenv("GATEWAY_URL", "http://127.0.0.1:8080"),
+		WalletURL:          getenv("WALLET_URL", "http://127.0.0.1:8083"),
+		AuthzHealthURL:     getenv("AUTHZ_HEALTH_URL", "http://127.0.0.1:8081"),
+		LockURL:            getenv("LOCK_URL", "http://127.0.0.1:8090"),
+		SensorURL:          getenv("SENSOR_URL", "http://127.0.0.1:8091"),
+		LightURL:           getenv("LIGHT_URL", "http://127.0.0.1:8092"),
+		ServiceAuthToken:   getenv("SERVICE_AUTH_TOKEN", "blackwall-demo-service-token"),
+		OwnerIssuanceToken: getenv("OWNER_ISSUANCE_TOKEN", "blackwall-demo-owner-issuance-token"),
+		GatewayID:          getenv("GATEWAY_ID", "gateway-home-1"),
+		DeviceID:           getenv("DEVICE_ID", "lock-front-door"),
+		SensorDeviceID:     getenv("SENSOR_DEVICE_ID", "sensor-living-room"),
+		LightDeviceID:      getenv("LIGHT_DEVICE_ID", "light-living-room"),
+		Timeout:            10 * time.Second,
 	}
 }
 
@@ -291,6 +295,7 @@ func (c *Client) checkOne(name, url string) ServiceHealth {
 	if err != nil {
 		return ServiceHealth{Name: name, URL: url, OK: false, Error: err.Error()}
 	}
+	c.setServiceAuthHeader(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -704,6 +709,7 @@ func (c *Client) getJSON(url string, out any) error {
 	if err != nil {
 		return err
 	}
+	c.setServiceAuthHeader(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -739,6 +745,10 @@ func (c *Client) postJSON(url string, in any, out any, expectedStatus int) error
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setServiceAuthHeader(req)
+	if url == c.cfg.IssuerURL+"/credentials/owner" {
+		req.Header.Set("X-Blackwall-Owner-Issuance-Token", c.cfg.OwnerIssuanceToken)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -762,6 +772,10 @@ func (c *Client) postJSON(url string, in any, out any, expectedStatus int) error
 		return fmt.Errorf("decode response failed: %w body=%s", err, string(body))
 	}
 	return nil
+}
+
+func (c *Client) setServiceAuthHeader(req *http.Request) {
+	req.Header.Set("X-Blackwall-Service-Token", c.cfg.ServiceAuthToken)
 }
 
 func IssueOwnerCredential(cfg Config, subject string, actions ...string) Credential {

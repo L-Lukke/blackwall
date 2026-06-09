@@ -11,6 +11,14 @@ import (
 	"time"
 )
 
+const (
+	demoServiceAuthToken   = "blackwall-demo-service-token"
+	demoOwnerIssuanceToken = "blackwall-demo-owner-issuance-token"
+	demoIssuerSeedHex      = "298754db2dbab6ec62605ceb0379eb7ee376580359449efe0caa3aa06cd56736"
+	demoWalletSeedHex      = "f6a36f36c806d12794d5c307809762fd1f95d32278c6ac2c742c7b6a9249fbd5"
+	demoIssuerDID          = "did:key:z6MkqPsfMdhSg1HSGhoxJG9Pm16yEYZ7oGMJm6QVALhqM3m2"
+)
+
 type ServiceSpec struct {
 	Name    string
 	WorkDir string
@@ -88,7 +96,9 @@ func DefaultSpecs() []ServiceSpec {
 			Command: []string{"cargo", "run"},
 			Port:    8081,
 			Env: []string{
-				"TRUSTED_ISSUER=did:key:z6MkqPsfMdhSg1HSGhoxJG9Pm16yEYZ7oGMJm6QVALhqM3m2",
+				"AUTHZ_ADDR=127.0.0.1:8081",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
+				"TRUSTED_ISSUER=" + demoIssuerDID,
 				"GATEWAY_ID=gateway-home-1",
 				"POLICY_FILE=../../testdata/policies/devices.json",
 				"REVOCATION_FILE=../../testdata/revocations/revoked_ids.json",
@@ -98,22 +108,31 @@ func DefaultSpecs() []ServiceSpec {
 			Name:    "lock-sim",
 			WorkDir: "devices/lock-sim",
 			Command: []string{"go", "run", "."},
-			Env:     nil,
-			Port:    8090,
+			Env: []string{
+				"LOCK_ADDR=127.0.0.1:8090",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
+			},
+			Port: 8090,
 		},
 		{
 			Name:    "sensor-sim",
 			WorkDir: "devices/sensor-sim",
 			Command: []string{"go", "run", "."},
-			Env:     nil,
-			Port:    8091,
+			Env: []string{
+				"SENSOR_ADDR=127.0.0.1:8091",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
+			},
+			Port: 8091,
 		},
 		{
 			Name:    "light-sim",
 			WorkDir: "devices/light-sim",
 			Command: []string{"go", "run", "."},
-			Env:     nil,
-			Port:    8092,
+			Env: []string{
+				"LIGHT_ADDR=127.0.0.1:8092",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
+			},
+			Port: 8092,
 		},
 		{
 			Name:    "gateway",
@@ -121,6 +140,8 @@ func DefaultSpecs() []ServiceSpec {
 			Command: []string{"go", "run", "."},
 			Port:    8080,
 			Env: []string{
+				"GATEWAY_ADDR=127.0.0.1:8080",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
 				"AUTHZ_URL=http://127.0.0.1:8081/v1/authorize",
 				"GATEWAY_ID=gateway-home-1",
 				"LOCK_URL=http://127.0.0.1:8090",
@@ -135,8 +156,13 @@ func DefaultSpecs() []ServiceSpec {
 			Command: []string{"go", "run", "."},
 			Port:    8082,
 			Env: []string{
-				"ISSUER_DID=did:key:z6MkqPsfMdhSg1HSGhoxJG9Pm16yEYZ7oGMJm6QVALhqM3m2",
+				"ISSUER_ADDR=127.0.0.1:8082",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
+				"OWNER_ISSUANCE_TOKEN=" + demoOwnerIssuanceToken,
+				"ISSUER_ED25519_SEED_HEX=" + demoIssuerSeedHex,
+				"ISSUER_DID=" + demoIssuerDID,
 				"SAVE_CREDENTIALS_DIR=../../testdata/credentials",
+				"REVOCATION_FILE=../../testdata/revocations/revoked_ids.json",
 			},
 		},
 		{
@@ -144,7 +170,11 @@ func DefaultSpecs() []ServiceSpec {
 			WorkDir: "holder/go-wallet",
 			Command: []string{"go", "run", "."},
 			Port:    8083,
-			Env:     nil,
+			Env: []string{
+				"WALLET_ADDR=127.0.0.1:8083",
+				"SERVICE_AUTH_TOKEN=" + demoServiceAuthToken,
+				"WALLET_ED25519_SEED_HEX=" + demoWalletSeedHex,
+			},
 		},
 	}
 }
