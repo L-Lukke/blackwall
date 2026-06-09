@@ -100,7 +100,7 @@ Make sure the following tools are available locally:
 
 - `go`
 - `cargo`
-- a C toolchain for the Go SQLite driver
+- `sqlite`
 
 Also run all commands from the **repository root**, unless noted otherwise.
 
