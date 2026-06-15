@@ -19,6 +19,14 @@ The main architectural goal is to demonstrate that **smart devices do not need t
 
 ---
 
+## Project status
+
+This repository is a PoC. It is intended to demonstrate the architecture, security flow, and evaluation scenarios, not to serve as production smart-home infrastructure.
+
+The completed scope includes credential issuance, holder wallet presentations, gateway-mediated authorization, delegation, revocation, ownership transfer, data-flow mediation, local policy enforcement, durable audit/runtime state, focused tests, all-device smoke checks, CI, and reproducible operational commands.
+
+The remaining production-grade concerns are documented as future work: richer household policy semantics, authenticated policy administration, standards-aligned revocation lists, selective disclosure, production key storage, multi-gateway state replication, formal API specifications, and release-blocking performance baselines.
+
 ## Simple architecture diagram
 
 
@@ -50,35 +58,22 @@ flowchart LR
     Gateway -- "7. Execute only if allowed" --> Devices
 ```
 
-## Implemented / To be implemented
+## Completed scope
 
-### Already implemented
-
-- Initial PoC architecture and service split
-- First end-to-end vertical slice for **owner control**
-- Initial **owner credential issuance** endpoint in the issuer
-- Initial **authorization** endpoint in the Rust authz service
-- Initial **gateway access request** endpoint
-- First device simulator (**lock-sim**) and gateway-mediated lock control
-- **Delegation** credential support and delegated access flows
-- **Revocation** support and revocation-aware authorization
-- **Ownership transfer** flows
-- Additional device simulators and adapters (**light**, **sensor**)
-- Data-flow mediation/redirection for compatible devices
-- Audit logging and authorization traceability
-- Scenario runners for all evaluation scenarios
-- VC-shaped SSI credentials with DID issuers, holder subjects, credential status, and Ed25519 Data Integrity proofs
-- `did:key` resolution behind a DID document/resolver boundary for issuer and holder verification keys
-- Holder wallet and challenge-bound verifiable presentation flow
-- Durable SQLite-backed VP challenges with expiry, subject/device/action binding, and one-time atomic consumption
-- Issuer-side delegation, revocation, and ownership-transfer operations require challenge-bound owner VPs
-- SQLite-backed credentials, revocations, audit events, device executions, sensor readings, and wallet state
-
-### To be implemented
-
-- Local policy management and richer household rules
-- Automated regression tests and performance measurements
-- API documentation, scripts, and CI workflows
+- Gateway-mediated SSI architecture with Go gateway, Go issuer, Go holder wallet, Rust authorization service, and Go device simulators.
+- Owner control, delegation, revocation, ownership transfer, VP challenge/replay protection, and data-flow mediation scenarios.
+- Lock, light, and sensor device adapters.
+- VC-shaped credentials with DID issuers, holder subjects, credential status, and Ed25519 Data Integrity-style proofs.
+- `did:key` resolution behind a DID document/resolver boundary for issuer and holder verification keys.
+- Holder wallet storage and challenge-bound verifiable presentation signing.
+- Durable SQLite-backed gateway challenges with expiry, subject/device/action binding, and one-time atomic consumption.
+- Issuer-side delegation, revocation, and ownership-transfer operations that require challenge-bound owner VPs.
+- SQLite-backed credentials, revocations, issuer challenges, delegations, ownership transfers, audit events, access attempts, device executions, sensor readings, wallet metadata, and wallet-held credentials.
+- Local policy enforcement from `configs/policies/devices.json`, with `scenarios/policyctl` for fixture inspection and updates.
+- Focused authorization, gateway, issuer, and wallet unit tests for critical SSI/security paths.
+- Non-interactive all-device scenario smoke runner with device, flow, timeout, and JSON options.
+- Repeatable scenario measurement runner.
+- CI/check scripts that run Go formatting/tests/vet, Rust formatting/check/clippy/tests, and all-device smoke validation.
 
 ---
 
@@ -92,7 +87,7 @@ The PoC is composed of local services:
 - **Holder wallet service (Go)**  
 - **Device simulators (Go)**  
 
-The recommended way to test the current PoC is to use the **scenario orchestrator**, which can start the local services and run the implemented scenarios from an interactive menu.
+The recommended way to test the current PoC is to use the top-level check script for automated checks, the smoke runner for non-interactive end-to-end validation, or the scenario orchestrator for manual exploration.
 
 ### Prerequisites
 
@@ -106,20 +101,103 @@ Also run all commands from the **repository root**, unless noted otherwise.
 
 ### Build checks
 
-Run the Go modules from their module directories:
+Run all standard checks from the repository root:
 
 ```bash
-(cd issuer/go-issuer && go test ./...)
-(cd gateway/go-api && go test ./...)
-(cd holder/go-wallet && go test ./...)
-(cd scenarios && go test ./...)
+make check
 ```
 
-Run the Rust authorization service checks from its package directory:
+This runs Go formatting, tests, and vet across all Go modules, plus Rust formatting, `cargo check`, `cargo clippy`, and `cargo test`.
+
+To include the non-interactive all-device scenario smoke run:
 
 ```bash
-(cd gateway/rust-authz && cargo check)
+make smoke
 ```
+
+Useful smoke options:
+
+```bash
+go run ./scenarios/smoke -device all
+go run ./scenarios/smoke -device sensor -flow vp-challenge
+go run ./scenarios/smoke -device lock -flow delegation -json
+```
+
+### Final Validation
+
+Before archiving, tagging, or handing off the PoC, run:
+
+```bash
+make check
+make smoke-all
+```
+
+These commands exercise the full local validation surface: unit checks, Rust linting, and all-device scenario smoke coverage.
+
+### Policy and Measurements
+
+List the local policy fixture:
+
+```bash
+make policy-list
+```
+
+Update a device allowlist:
+
+```bash
+go run ./scenarios/policyctl -device light-living-room -actions turn_on,turn_off
+```
+
+Run a repeatable scenario measurement:
+
+```bash
+make measure
+go run ./scenarios/measure -device sensor -flow vp-challenge -n 25
+```
+
+Reset runtime databases and scenario logs:
+
+```bash
+make reset
+```
+
+## Service endpoints
+
+The services expose small JSON HTTP APIs for the PoC scenarios.
+
+Gateway API:
+
+* `GET /health`
+* `POST /access/challenge`
+* `POST /access/request`
+
+Authorization service:
+
+* `GET /health`
+* `POST /v1/authorize`
+
+Issuer service:
+
+* `GET /health`
+* `POST /credentials/challenge`
+* `POST /credentials/owner`
+* `POST /credentials/delegation`
+* `POST /credentials/revoke`
+* `POST /credentials/transfer`
+
+Holder wallet:
+
+* `GET /health`
+* `GET /wallet/did`
+* `POST /wallet/credentials`
+* `POST /wallet/presentations`
+
+Device simulators:
+
+* `GET /health`
+* lock: `POST /lock`, `POST /unlock`
+* light: `POST /turn_on`, `POST /turn_off`
+* sensor: `GET /reading?device_id=...`
 
 ### Using the orchestrator
 
@@ -271,9 +349,25 @@ The repository tracks source code, lockfiles, policy fixtures, and empty fixture
 * Orchestrator logs under `scenarios/.logs/`
 * Runtime SQLite databases and WAL/SHM files under `runtime/`
 
-To reset runtime state between manual scenario runs, remove the generated databases under `runtime/`. The seed policy fixture under `configs/policies/` is kept in version control.
+To reset runtime state between manual scenario runs, use `make reset`. The seed policy fixture under `configs/policies/` is kept in version control.
+
+### Known limits
+
+This PoC intentionally does not provide:
+
+* production wallet/key storage or recovery
+* full VC Data Integrity canonicalization
+* selective disclosure
+* DID methods beyond local `did:key`
+* standards-aligned Status List revocation
+* authenticated runtime policy administration
+* multi-gateway challenge/state replication
+* distributed state storage
+* formal OpenAPI specifications
+* release-blocking performance thresholds
 
 ### Notes
 
 * The orchestrator uses `127.0.0.1` for service URLs to avoid local IPv6 `localhost` issues on some systems.
 * The current automated test flow covers **owner control**, **delegation**, **revocation**, **ownership transfer**, **data-flow mediation**, and **VP challenge**.
+* This project is closed as a PoC; future productionization should start from a new plan or ADR rather than expanding the demo scope indefinitely.

@@ -10,6 +10,7 @@ Thumbs.db
 bin/
 *.test
 coverage.out
+.cache/
 
 target/
 **/target/

@@ -36,7 +36,7 @@ struct Proof {
     proof_value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Credential {
     #[serde(rename = "@context")]
     context: Vec<String>,
@@ -56,7 +56,7 @@ struct Credential {
     proof: Option<Proof>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CredentialSubject {
     id: String,
     gateway: String,
@@ -90,7 +90,7 @@ struct CredentialSubject {
     replaces_credential_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CredentialStatus {
     id: String,
     #[serde(rename = "type")]
@@ -110,48 +110,6 @@ struct AuthzRequest {
     challenge: Option<String>,
     #[serde(default)]
     presentation: Option<VerifiablePresentation>,
-}
-
-impl Default for Credential {
-    fn default() -> Self {
-        Self {
-            context: vec![],
-            id: String::new(),
-            cred_type: vec![],
-            issuer: String::new(),
-            valid_from: String::new(),
-            valid_until: String::new(),
-            credential_subject: CredentialSubject::default(),
-            credential_status: CredentialStatus::default(),
-            proof: None,
-        }
-    }
-}
-
-impl Default for CredentialSubject {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            gateway: String::new(),
-            device_scopes: vec![],
-            action_scopes: vec![],
-            delegated_by: None,
-            parent_credential_id: None,
-            transferred_by: None,
-            replaces_credential_id: None,
-        }
-    }
-}
-
-impl Default for CredentialStatus {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            status_type: String::new(),
-            status_purpose: String::new(),
-            status: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,4 +535,296 @@ fn required_env(key: &str) -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| panic!("{} must be set", key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::path::PathBuf;
+
+    const DEVICE_ID: &str = "lock-front-door";
+    const ACTION: &str = "unlock";
+    const GATEWAY_ID: &str = "gateway-home-1";
+
+    #[test]
+    fn denies_bad_credential_signature() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) = fixture(&[ACTION], &[]);
+        let mut cred = signed_owner_credential(&issuer_key, &issuer_did, &holder_did);
+        cred.proof.as_mut().unwrap().proof_value = "00".repeat(64);
+
+        let req = signed_request(cred, &holder_key, &holder_did, ACTION, "challenge");
+
+        assert_denied(req, &state, "bad_signature");
+    }
+
+    #[test]
+    fn denies_expired_credential() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) = fixture(&[ACTION], &[]);
+        let mut cred = unsigned_owner_credential(&issuer_did, &holder_did);
+        cred.valid_from = (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
+        cred.valid_until = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sign_credential(&mut cred, &issuer_key, &issuer_did);
+
+        let req = signed_request(cred, &holder_key, &holder_did, ACTION, "challenge");
+
+        assert_denied(req, &state, "credential_expired");
+    }
+
+    #[test]
+    fn denies_revoked_credential() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) =
+            fixture(&[ACTION], &["urn:uuid:test-credential"]);
+        let cred = signed_owner_credential(&issuer_key, &issuer_did, &holder_did);
+
+        let req = signed_request(cred, &holder_key, &holder_did, ACTION, "challenge");
+
+        assert_denied(req, &state, "credential_revoked");
+    }
+
+    #[test]
+    fn denies_device_scope_mismatch() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) = fixture(&[ACTION], &[]);
+        let mut cred = unsigned_owner_credential(&issuer_did, &holder_did);
+        cred.credential_subject.device_scopes = vec!["light-living-room".to_string()];
+        sign_credential(&mut cred, &issuer_key, &issuer_did);
+
+        let req = signed_request(cred, &holder_key, &holder_did, ACTION, "challenge");
+
+        assert_denied(req, &state, "device_out_of_scope");
+    }
+
+    #[test]
+    fn denies_action_scope_mismatch() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) = fixture(&[ACTION], &[]);
+        let mut cred = unsigned_owner_credential(&issuer_did, &holder_did);
+        cred.credential_subject.action_scopes = vec!["lock".to_string()];
+        sign_credential(&mut cred, &issuer_key, &issuer_did);
+
+        let req = signed_request(cred, &holder_key, &holder_did, ACTION, "challenge");
+
+        assert_denied(req, &state, "action_out_of_scope");
+    }
+
+    #[test]
+    fn denies_local_policy_mismatch() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) = fixture(&["lock"], &[]);
+        let cred = signed_owner_credential(&issuer_key, &issuer_did, &holder_did);
+
+        let req = signed_request(cred, &holder_key, &holder_did, ACTION, "challenge");
+
+        assert_denied(req, &state, "denied_by_local_policy");
+    }
+
+    #[test]
+    fn denies_presentation_challenge_mismatch() {
+        let (state, issuer_key, holder_key, issuer_did, holder_did) = fixture(&[ACTION], &[]);
+        let cred = signed_owner_credential(&issuer_key, &issuer_did, &holder_did);
+        let mut req = signed_request(cred, &holder_key, &holder_did, ACTION, "proof-challenge");
+        req.challenge = Some("request-challenge".to_string());
+
+        assert_denied(req, &state, "presentation_challenge_mismatch");
+    }
+
+    fn fixture(
+        allowed_policy_actions: &[&str],
+        revoked_ids: &[&str],
+    ) -> (AppState, SigningKey, SigningKey, String, String) {
+        let issuer_key = SigningKey::from_bytes(&[1; 32]);
+        let holder_key = SigningKey::from_bytes(&[2; 32]);
+        let issuer_did = did_key_from_signing_key(&issuer_key);
+        let holder_did = did_key_from_signing_key(&holder_key);
+        let policy_file = write_policy(allowed_policy_actions);
+        let issuer_db_path = write_issuer_db(revoked_ids);
+
+        (
+            AppState {
+                trusted_issuer: issuer_did.clone(),
+                gateway_id: GATEWAY_ID.to_string(),
+                policy_file,
+                issuer_db_path,
+                service_auth_token: "test-service-token".to_string(),
+            },
+            issuer_key,
+            holder_key,
+            issuer_did,
+            holder_did,
+        )
+    }
+
+    fn signed_owner_credential(
+        issuer_key: &SigningKey,
+        issuer_did: &str,
+        holder_did: &str,
+    ) -> Credential {
+        let mut cred = unsigned_owner_credential(issuer_did, holder_did);
+        sign_credential(&mut cred, issuer_key, issuer_did);
+        cred
+    }
+
+    fn unsigned_owner_credential(issuer_did: &str, holder_did: &str) -> Credential {
+        Credential {
+            context: vec![
+                "https://www.w3.org/ns/credentials/v2".to_string(),
+                "https://blackwall.local/contexts/smart-home-credential/v1".to_string(),
+            ],
+            id: "urn:uuid:test-credential".to_string(),
+            cred_type: vec![
+                "VerifiableCredential".to_string(),
+                "OwnerCredential".to_string(),
+            ],
+            issuer: issuer_did.to_string(),
+            valid_from: (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
+            valid_until: (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+            credential_subject: CredentialSubject {
+                id: holder_did.to_string(),
+                gateway: GATEWAY_ID.to_string(),
+                device_scopes: vec![DEVICE_ID.to_string()],
+                action_scopes: vec![ACTION.to_string()],
+                ..CredentialSubject::default()
+            },
+            credential_status: CredentialStatus {
+                id: "urn:uuid:test-credential#status".to_string(),
+                status_type: "StatusList2021Entry".to_string(),
+                status_purpose: "revocation".to_string(),
+                status: "active".to_string(),
+            },
+            proof: None,
+        }
+    }
+
+    fn sign_credential(cred: &mut Credential, issuer_key: &SigningKey, issuer_did: &str) {
+        let signature = issuer_key.sign(signing_input(cred).as_bytes());
+        cred.proof = Some(Proof {
+            proof_type: "DataIntegrityProof".to_string(),
+            cryptosuite: "eddsa-rdfc-2022".to_string(),
+            created: Utc::now().to_rfc3339(),
+            verification_method: format!("{}#key-1", issuer_did),
+            proof_purpose: "assertionMethod".to_string(),
+            proof_value: hex::encode(signature.to_bytes()),
+        });
+    }
+
+    fn signed_request(
+        cred: Credential,
+        holder_key: &SigningKey,
+        holder_did: &str,
+        action: &str,
+        challenge: &str,
+    ) -> AuthzRequest {
+        let mut presentation = VerifiablePresentation {
+            context: vec!["https://www.w3.org/ns/credentials/v2".to_string()],
+            id: "urn:uuid:test-presentation".to_string(),
+            pres_type: vec!["VerifiablePresentation".to_string()],
+            holder: holder_did.to_string(),
+            verifiable_credential: vec![cred],
+            proof: None,
+        };
+        let signature = holder_key.sign(presentation_signing_input(&presentation).as_bytes());
+        presentation.proof = Some(PresentationProof {
+            proof_type: "DataIntegrityProof".to_string(),
+            cryptosuite: "eddsa-rdfc-2022".to_string(),
+            created: Utc::now().to_rfc3339(),
+            verification_method: format!("{}#key-1", holder_did),
+            proof_purpose: "authentication".to_string(),
+            challenge: challenge.to_string(),
+            domain: GATEWAY_ID.to_string(),
+            proof_value: hex::encode(signature.to_bytes()),
+        });
+
+        AuthzRequest {
+            subject: holder_did.to_string(),
+            device_id: DEVICE_ID.to_string(),
+            action: action.to_string(),
+            challenge: Some(challenge.to_string()),
+            presentation: Some(presentation),
+        }
+    }
+
+    fn assert_denied(req: AuthzRequest, state: &AppState, reason: &str) {
+        assert_eq!(evaluate(state, &req), Err(reason.to_string()));
+    }
+
+    fn write_policy(allowed_actions: &[&str]) -> String {
+        let path = temp_path("policy", "json");
+        let actions = allowed_actions
+            .iter()
+            .map(|action| format!(r#""{}""#, action))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"devices":{{"{}":{{"allowed_actions":[{}]}}}}}}"#,
+                DEVICE_ID, actions
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn write_issuer_db(revoked_ids: &[&str]) -> String {
+        let path = temp_path("issuer", "db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE revocations (credential_id TEXT PRIMARY KEY)",
+            [],
+        )
+        .unwrap();
+        for id in revoked_ids {
+            conn.execute("INSERT INTO revocations (credential_id) VALUES (?1)", [id])
+                .unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    fn temp_path(label: &str, ext: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "blackwall-authz-{}-{}-{}.{}",
+            label,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap(),
+            ext
+        ))
+    }
+
+    fn did_key_from_signing_key(key: &SigningKey) -> String {
+        let mut prefixed = vec![0xed, 0x01];
+        prefixed.extend_from_slice(key.verifying_key().as_bytes());
+        format!("did:key:z{}", base58_encode(&prefixed))
+    }
+
+    fn base58_encode(raw: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        if raw.is_empty() {
+            return String::new();
+        }
+
+        let mut digits = vec![0u8];
+        for byte in raw {
+            let mut carry = *byte as u32;
+            for digit in digits.iter_mut().rev() {
+                carry += (*digit as u32) << 8;
+                *digit = (carry % 58) as u8;
+                carry /= 58;
+            }
+            while carry > 0 {
+                digits.insert(0, (carry % 58) as u8);
+                carry /= 58;
+            }
+        }
+
+        for byte in raw {
+            if *byte == 0 {
+                digits.insert(0, 0);
+            } else {
+                break;
+            }
+        }
+
+        digits
+            .iter()
+            .map(|digit| ALPHABET[*digit as usize] as char)
+            .collect()
+    }
 }

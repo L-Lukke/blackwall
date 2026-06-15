@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            **/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway/rust-authz
+
+      - name: Install SQLite build dependency
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Run checks and smoke scenario
+        run: SMOKE_DEVICE=all bash scripts/check.sh --smoke
