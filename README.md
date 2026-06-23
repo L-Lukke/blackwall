@@ -9,10 +9,10 @@ The main architectural choices are recorded in [ADR 0001: Gateway-Mediated SSI P
 
 The PoC is designed around five main components:
 
-- **Gateway API (Go):** receives access requests and mediates communication with devices
-- **Authorization service (Rust):** evaluates credentials, revocation state, and local policy to return allow/deny decisions
-- **Issuer service (Go):** issues authorization credentials for users
-- **Holder wallet service (Go):** owns a holder `did:key`, stores credentials, and signs verifiable presentations
+- **Gateway API:** receives access requests and mediates communication with devices
+- **Authorization service:** evaluates credentials, revocation state, and local policy to return allow/deny decisions
+- **Issuer service:** issues authorization credentials for users
+- **Holder wallet service:** owns a holder `did:key`, stores credentials, and signs verifiable presentations
 - **Device simulators:** emulate smart home devices such as locks, lights, and sensors
 
 The main architectural goal is to demonstrate that **smart devices do not need to implement SSI directly**. Instead, a **locally controlled gateway** handles identity and authorization logic on their behalf.
